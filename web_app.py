@@ -1374,6 +1374,21 @@ async def evaluate_video(
         yield f"data: {json.dumps({'step': 'error', 'message': f'Evaluation succeeded but post-processing failed: {post_ex}'})}\n\n"
     finally:
       credits_mod.release_job_slot(user_id)
+      # Mark render as failed if it's still in a non-terminal state
+      # (e.g. client disconnect, unexpected error)
+      try:
+        _db_fin = next(get_db())
+        _r_fin = _db_fin.query(Render).filter(Render.render_id == report_id).first()
+        if _r_fin and _r_fin.status in ("queued", "rendering"):
+          _r_fin.status = "failed"
+          _r_fin.finished_at = datetime.datetime.utcnow()
+          _r_fin.error_code = "STREAM_INTERRUPTED"
+          _r_fin.error_message = "Render interrupted (client disconnect or unexpected error)"
+          _db_fin.commit()
+          logging.warning("Marked interrupted render %s as failed", report_id)
+        _db_fin.close()
+      except Exception as ex:
+        logging.error("Failed to mark interrupted render %s as failed: %s", report_id, ex)
 
   return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -1717,6 +1732,15 @@ async def evaluate_file(
 
   except Exception as ex:
     logging.error(f"Evaluation failed: {ex}", exc_info=True)
+    # Mark render as failed so it doesn't stay stuck
+    try:
+      render_row.status = "failed"
+      render_row.finished_at = datetime.datetime.utcnow()
+      render_row.error_code = "EVALUATION_ERROR"
+      render_row.error_message = str(ex)[:500]
+      db.commit()
+    except Exception as db_ex:
+      logging.error("Failed to mark render as failed: %s", db_ex)
     return JSONResponse(
         {"error": f"Evaluation failed: {str(ex)}"},
         status_code=500,
@@ -1938,11 +1962,54 @@ async def serve_comparison_report(comparison_id: str):
   return HTMLResponse(content=html)
 
 
+# ---------------------------------------------------------------------------
+# Stale render reaper — marks renders stuck in non-terminal states
+# ---------------------------------------------------------------------------
+STALE_RENDER_THRESHOLD_SECONDS = 600  # 10 minutes
+
+
+async def _reap_stale_renders():
+  """Periodically mark renders stuck in 'queued'/'rendering' as failed."""
+  while True:
+    await asyncio.sleep(120)  # check every 2 minutes
+    try:
+      cutoff = datetime.datetime.utcnow() - datetime.timedelta(
+          seconds=STALE_RENDER_THRESHOLD_SECONDS,
+      )
+      db = next(get_db())
+      stale = (
+          db.query(Render)
+          .filter(
+              Render.status.in_(["queued", "rendering"]),
+              Render.started_at < cutoff,
+          )
+          .all()
+      )
+      for r in stale:
+        r.status = "failed"
+        r.finished_at = datetime.datetime.utcnow()
+        r.error_code = "STALE_TIMEOUT"
+        r.error_message = (
+            f"Render was stuck in '{r.status}' for over "
+            f"{STALE_RENDER_THRESHOLD_SECONDS}s and was automatically failed"
+        )
+        logging.warning("Reaped stale render %s (started %s)", r.render_id, r.started_at)
+      if stale:
+        db.commit()
+        logging.info("Reaped %d stale render(s)", len(stale))
+      db.close()
+    except Exception as ex:
+      logging.error("Stale render reaper error: %s", ex)
+
+
 @app.on_event("startup")
 async def _prewarm():
   """Init DB, run auth migrations, and pre-warm Gemini connection on startup."""
   init_db()
   logging.info("Database initialized")
+
+  # Start background reaper for stuck renders
+  asyncio.create_task(_reap_stale_renders())
 
   # Ensure auth columns exist (idempotent)
   try:
