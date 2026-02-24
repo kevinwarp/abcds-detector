@@ -33,6 +33,8 @@ if _env_path.is_file():
 import benchmarking
 import models
 import performance_predictor
+from script_writer.script_writer_service import script_writer_service
+from script_writer.script_models import ScriptBrief, ScriptFormat, ScriptTone
 import platform_optimizer
 import reference_library
 import report_service
@@ -43,7 +45,7 @@ from evaluation_services import video_evaluation_service
 from evaluation_services import confidence_calibration_service
 from helpers import generic_helpers
 from sqlalchemy import text
-from db import init_db, get_db, Render, User
+from db import init_db, get_db, Render, User, GeneratedScript as GeneratedScriptRow
 from auth import router as auth_router, get_current_user
 from billing import router as billing_router
 from admin import router as admin_router
@@ -1960,6 +1962,163 @@ async def serve_comparison_report(comparison_id: str):
     return HTMLResponse("<h1>Comparison report not found</h1>", status_code=404)
   html = report_service.generate_comparison_report_html(data)
   return HTMLResponse(content=html)
+
+
+# ---------------------------------------------------------------------------
+# Script Writer endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/script/generate")
+@limiter.limit("5/minute")
+async def generate_script(
+    request: Request,
+    brand_name: str = Form(...),
+    product_name: str = Form(...),
+    product_description: str = Form(""),
+    target_audience: str = Form(""),
+    key_message: str = Form(""),
+    call_to_action: str = Form(""),
+    script_format: str = Form("LONG_FORM"),
+    tone: str = Form("PROFESSIONAL"),
+    duration_seconds: int = Form(30),
+    additional_instructions: str = Form(""),
+    brand_guidelines: str = Form(""),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Generate an ABCDs-compliant ad script from a creative brief."""
+    try:
+        fmt = ScriptFormat[script_format.upper()]
+    except KeyError:
+        return JSONResponse(
+            {"error": f"Invalid script_format: {script_format}. Use LONG_FORM or SHORTS."},
+            status_code=400,
+        )
+    try:
+        tone_enum = ScriptTone[tone.upper()]
+    except KeyError:
+        return JSONResponse(
+            {"error": f"Invalid tone: {tone}. Use one of: {', '.join(t.name for t in ScriptTone)}"},
+            status_code=400,
+        )
+
+    brief = ScriptBrief(
+        brand_name=brand_name,
+        product_name=product_name,
+        product_description=product_description,
+        target_audience=target_audience,
+        key_message=key_message,
+        call_to_action=call_to_action,
+        script_format=fmt,
+        tone=tone_enum,
+        duration_seconds=duration_seconds,
+        additional_instructions=additional_instructions,
+        brand_guidelines=brand_guidelines,
+    )
+
+    config = build_config(use_abcd=True, use_shorts=False, use_ci=False)
+
+    try:
+        script, validations = await asyncio.get_event_loop().run_in_executor(
+            None, script_writer_service.generate_and_validate, config, brief
+        )
+    except Exception as ex:
+        logging.error("Script generation failed: %s", ex, exc_info=True)
+        return JSONResponse({"error": "Script generation failed", "detail": str(ex)}, status_code=500)
+
+    # Persist to database
+    import dataclasses as _dc
+
+    def _to_dict(obj):
+        if _dc.is_dataclass(obj) and not isinstance(obj, type):
+            return {k: _to_dict(v) for k, v in _dc.asdict(obj).items()}
+        if isinstance(obj, list):
+            return [_to_dict(i) for i in obj]
+        if isinstance(obj, dict):
+            return {k: _to_dict(v) for k, v in obj.items()}
+        return obj
+
+    script_dict = _to_dict(script)
+    validation_dicts = _to_dict(validations)
+
+    row = GeneratedScriptRow(
+        user_id=current_user.id,
+        brand_name=brand_name,
+        product_name=product_name,
+        target_audience=target_audience,
+        key_message=key_message,
+        call_to_action=call_to_action,
+        script_format=script_format.upper(),
+        tone=tone.upper(),
+        duration_seconds=duration_seconds,
+        title=script.title,
+        concept=script.concept,
+        script_json=json.dumps(script_dict),
+        validation_json=json.dumps(validation_dicts),
+        abcd_score_pct=script.abcd_score_summary.get("score_pct"),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    return JSONResponse({
+        "script_id": row.id,
+        "script": script_dict,
+        "validation": validation_dicts,
+    })
+
+
+@app.get("/api/script/{script_id}")
+async def get_script(
+    script_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Retrieve a previously generated script by ID."""
+    row = db.query(GeneratedScriptRow).filter(
+        GeneratedScriptRow.id == script_id,
+        GeneratedScriptRow.user_id == current_user.id,
+    ).first()
+    if not row:
+        return JSONResponse({"error": "Script not found"}, status_code=404)
+
+    return JSONResponse({
+        "script_id": row.id,
+        "script": json.loads(row.script_json),
+        "validation": json.loads(row.validation_json) if row.validation_json else None,
+        "abcd_score_pct": row.abcd_score_pct,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    })
+
+
+@app.get("/api/scripts")
+async def list_scripts(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List all scripts generated by the current user."""
+    rows = (
+        db.query(GeneratedScriptRow)
+        .filter(GeneratedScriptRow.user_id == current_user.id)
+        .order_by(GeneratedScriptRow.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return JSONResponse({
+        "scripts": [
+            {
+                "script_id": r.id,
+                "title": r.title,
+                "brand_name": r.brand_name,
+                "product_name": r.product_name,
+                "script_format": r.script_format,
+                "abcd_score_pct": r.abcd_score_pct,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
+    })
 
 
 # ---------------------------------------------------------------------------
