@@ -780,6 +780,7 @@ $('detailTabs').addEventListener('click', e => {
 function renderDetailActions(d) {
   const acts = $('detailActions');
   acts.innerHTML = '';
+  if (d.report_url) acts.innerHTML += `<a href="${d.report_url}" target="_blank"><button>📊 View Report</button></a>`;
   if (d.output_url) acts.innerHTML += `<a href="${d.output_url}" target="_blank"><button>⬇ Download</button></a>`;
   acts.innerHTML += `<button onclick="rerunRender('${d.render_id}');closeDetail()">↻ Re-run</button>`;
   if (d.status === 'queued' || d.status === 'rendering') acts.innerHTML += `<button onclick="cancelRender('${d.render_id}');closeDetail()">⏹ Cancel</button>`;
@@ -801,6 +802,8 @@ function renderDetailTabs(d) {
     ${field('File Size', d.file_size_mb != null ? `${d.file_size_mb} MB` : '—')}
     ${field('Model', d.model || '—')}
     ${field('Pipeline', d.pipeline_version || '—')}
+    ${field('Report URL', d.report_url ? `<a href="${d.report_url}" target="_blank" style="color:var(--purple)">${d.report_url}</a>` : '—')}
+    ${field('Slack Notified', d.slack_notified ? '<span style="color:var(--green)">✓ Sent</span>' : '—')}
     ${d.error_code ? field('Error', `<span style="color:var(--red)">${d.error_code}: ${d.error_message || ''}</span>`) : ''}
   `;
 

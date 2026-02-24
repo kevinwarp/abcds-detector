@@ -1179,52 +1179,48 @@ async def evaluate_video(
         await asyncio.sleep(0.3)
 
       # Finalize: assign report ID, cache, notify
+      results["report_id"] = report_id
+      results["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+      results["tokens_used"] = tokens_used
+      results["credits_remaining"] = credits_after_deduct
+      results["user_email"] = user_email
+      results_store[report_id] = results
+      _save_results_to_gcs(report_id, results)
+
+      # Log scores for benchmark history
       try:
-        results["report_id"] = report_id
-        results["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
-        results["tokens_used"] = tokens_used
-        results["credits_remaining"] = credits_after_deduct
-        results_store[report_id] = results
-        _save_results_to_gcs(report_id, results)
-
-        # Log scores for benchmark history
-        try:
-          benchmarking.log_evaluation(
-              report_id=report_id,
-              abcd_score=results.get("abcd", {}).get("score", 0),
-              persuasion_density=results.get("persuasion", {}).get("density", 0),
-              performance_score=results.get("predictions", {}).get("overall_score", 0),
-              vertical=results.get("brand_intelligence", {}).get("product_service", ""),
-          )
-        except Exception as ex:
-          logging.error("Benchmark logging failed: %s", ex)
-
-        # Update render row → succeeded
-        try:
-          _db = next(get_db())
-          _r = _db.query(Render).filter(Render.render_id == report_id).first()
-          if _r:
-            _r.status = "succeeded"
-            _r.progress_pct = 100
-            _r.finished_at = datetime.datetime.utcnow()
-            _r.output_url = results.get("report_url")
-            _r.duration_seconds = results.get("video_metadata", {}).get("duration")
-            _r.file_size_mb = results.get("file_size_mb")
-            _db.commit()
-          _db.close()
-        except Exception as ex:
-          logging.error("Render row update failed: %s", ex)
-
-        base_url = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
-        report_url = f"{base_url}/report/{report_id}"
-        results["report_url"] = report_url
-
-        _send_slack_notification(results, report_url)
-
-        yield f"data: {json.dumps({'step': 'complete', 'pct': 100, 'data': results}, default=str)}\n\n"
+        benchmarking.log_evaluation(
+            report_id=report_id,
+            abcd_score=results.get("abcd", {}).get("score", 0),
+            persuasion_density=results.get("persuasion", {}).get("density", 0),
+            performance_score=results.get("predictions", {}).get("overall_score", 0),
+            vertical=results.get("brand_intelligence", {}).get("product_service", ""),
+        )
       except Exception as ex:
-        logging.error("SSE finalization failed for report %s: %s", report_id, ex, exc_info=True)
-        yield f"data: {json.dumps({'step': 'error', 'message': f'Finalization failed: {ex}'})}\n\n"
+        logging.error("Benchmark logging failed: %s", ex)
+
+      # Build report URL before updating the render row
+      base_url = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+      report_url = f"{base_url}/report/{report_id}"
+      results["report_url"] = report_url
+
+      # Update render row → succeeded
+      try:
+        _db = next(get_db())
+        _r = _db.query(Render).filter(Render.render_id == report_id).first()
+        if _r:
+          _r.status = "succeeded"
+          _r.progress_pct = 100
+          _r.finished_at = datetime.datetime.utcnow()
+          _r.output_url = report_url
+          _r.duration_seconds = results.get("video_metadata", {}).get("duration")
+          _r.file_size_mb = results.get("file_size_mb")
+          _db.commit()
+        _db.close()
+      except Exception as ex:
+        logging.error("Render row update failed: %s", ex)
+
+      _send_slack_notification(results, report_url)
       slack_sent = bool(SLACK_WEBHOOK_URL)
 
       # Record Slack notification status
@@ -1238,7 +1234,7 @@ async def evaluate_video(
       except Exception as ex:
         logging.error("Slack status update failed: %s", ex)
 
-      yield f"data: {json.dumps({'step': 'complete', 'pct': 100, 'data': results})}\n\n"
+      yield f"data: {json.dumps({'step': 'complete', 'pct': 100, 'data': results}, default=str)}\n\n"
     finally:
       credits_mod.release_job_slot(user_id)
 
@@ -1508,6 +1504,7 @@ async def evaluate_file(
       results["file_size_mb"] = round(file_size_mb, 2)
       results["tokens_used"] = tokens_used
       results["credits_remaining"] = current_user.credits_balance
+      results["user_email"] = current_user.email
 
       # Store in cache for later retrieval
       results_store[report_id] = results
