@@ -1229,13 +1229,10 @@ async def evaluate_video(
   def _run():
     return run_evaluation(gcs_uri, config, on_progress=on_progress)
 
-  EVALUATION_TIMEOUT_SECONDS = 300  # 5 minutes
-
   async def event_stream():
     loop = asyncio.get_event_loop()
     task = loop.run_in_executor(None, _run)
     results = None
-    start_time = asyncio.get_event_loop().time()
 
     try:
       while True:
@@ -1258,28 +1255,6 @@ async def evaluate_video(
             yield f"data: {json.dumps({'step': 'error', 'message': str(ex)})}\n\n"
             return
           break
-
-        # Check for timeout
-        elapsed = asyncio.get_event_loop().time() - start_time
-        if elapsed >= EVALUATION_TIMEOUT_SECONDS:
-          logging.error(
-              "Evaluation timed out after %d seconds for render %s",
-              EVALUATION_TIMEOUT_SECONDS, report_id,
-          )
-          task.cancel()
-          # Mark render row as failed
-          try:
-            _db_timeout = next(get_db())
-            _r_timeout = _db_timeout.query(Render).filter(Render.render_id == report_id).first()
-            if _r_timeout:
-              _r_timeout.status = "failed"
-              _r_timeout.finished_at = datetime.datetime.utcnow()
-              _db_timeout.commit()
-            _db_timeout.close()
-          except Exception as ex:
-            logging.error("Failed to update render row on timeout: %s", ex)
-          yield f"data: {json.dumps({'step': 'error', 'message': 'This asset took too long to process. Please try again or use a shorter video.'})}\n\n"
-          return
 
         await asyncio.sleep(0.3)
 
