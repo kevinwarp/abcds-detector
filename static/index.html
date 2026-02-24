@@ -1025,6 +1025,26 @@ $('btnEvaluate').addEventListener('click', async () => {
     const decoder = new TextDecoder();
     let finalData = null;
     let buffer = '';
+    let lastParseError = null;
+
+    function processLine(line) {
+      if (!line.startsWith('data: ')) return;
+      try {
+        const msg = JSON.parse(line.slice(6));
+        lastParseError = null;
+        if (msg.step === 'complete') {
+          finalData = msg.data;
+        } else if (msg.step === 'error') {
+          throw new Error(msg.message);
+        } else {
+          setProgress('info', msg.message, `Step: ${msg.step}`, msg.pct || 0);
+          if (msg.partial) renderPartial(msg.partial);
+        }
+      } catch (e) {
+        if (e.message && !e.message.includes('JSON')) throw e;
+        lastParseError = e;
+      }
+    }
 
     while (true) {
       const { done, value } = await reader.read();
@@ -1032,25 +1052,15 @@ $('btnEvaluate').addEventListener('click', async () => {
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop();
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        try {
-          const msg = JSON.parse(line.slice(6));
-          if (msg.step === 'complete') {
-            finalData = msg.data;
-          } else if (msg.step === 'error') {
-            throw new Error(msg.message);
-          } else {
-            setProgress('info', msg.message, `Step: ${msg.step}`, msg.pct || 0);
-            if (msg.partial) renderPartial(msg.partial);
-          }
-        } catch (e) {
-          if (e.message && !e.message.includes('JSON')) throw e;
-        }
-      }
+      for (const line of lines) processLine(line);
     }
+    // Process any remaining data left in the buffer
+    if (buffer.trim()) processLine(buffer.trim());
 
-    if (!finalData) throw new Error('Evaluation did not return results');
+    if (!finalData) {
+      if (lastParseError) throw new Error('Server returned invalid response data. Please try again.');
+      throw new Error('Evaluation did not return results. The connection may have been interrupted — please try again.');
+    }
     setStatus('success', `\u2705 Evaluation complete for <strong>${finalData.brand_name || finalData.video_name}</strong>`);
     renderResults(finalData);
     lastEvalData = finalData;

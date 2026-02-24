@@ -4,6 +4,7 @@
 
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -957,6 +958,23 @@ def _build_feature_timeline(
   }
 
 
+def _sanitize_for_json(obj):
+  """Recursively replace NaN/Infinity floats with None.
+
+  Python's json.dumps outputs literal NaN/Infinity tokens which are
+  not valid JSON and cause JSON.parse to fail in the browser.
+  """
+  if isinstance(obj, float):
+    if math.isnan(obj) or math.isinf(obj):
+      return None
+    return obj
+  if isinstance(obj, dict):
+    return {k: _sanitize_for_json(v) for k, v in obj.items()}
+  if isinstance(obj, list):
+    return [_sanitize_for_json(v) for v in obj]
+  return obj
+
+
 def _format_scenes(
     scenes: list[dict],
     keyframes: list[str],
@@ -1236,14 +1254,17 @@ async def evaluate_video(
     task = loop.run_in_executor(None, _run)
     results = None
     start_time = asyncio.get_event_loop().time()
+    last_heartbeat = start_time
 
     try:
       while True:
         # Drain progress messages
+        drained = False
         try:
           while True:
             msg = progress_q.get_nowait()
             yield f"data: {json.dumps(msg)}\n\n"
+            drained = True
         except queue.Empty:
           pass
 
@@ -1259,8 +1280,14 @@ async def evaluate_video(
             return
           break
 
+        # Send SSE heartbeat comment every 15s to keep proxies/CDNs alive
+        now = asyncio.get_event_loop().time()
+        if not drained and (now - last_heartbeat) >= 15:
+          yield ": heartbeat\n\n"
+          last_heartbeat = now
+
         # Check for timeout
-        elapsed = asyncio.get_event_loop().time() - start_time
+        elapsed = now - start_time
         if elapsed >= EVALUATION_TIMEOUT_SECONDS:
           logging.error(
               "Evaluation timed out after %d seconds for render %s",
@@ -1365,7 +1392,8 @@ async def evaluate_video(
         except Exception as ex:
           logging.error("Slack status update failed: %s", ex)
 
-        yield f"data: {json.dumps({'step': 'complete', 'pct': 100, 'data': results}, default=str)}\n\n"
+        safe_results = _sanitize_for_json(results)
+        yield f"data: {json.dumps({'step': 'complete', 'pct': 100, 'data': safe_results}, default=str)}\n\n"
       except Exception as post_ex:
         logging.error(
             "Post-success processing failed for render %s: %s",
