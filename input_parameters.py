@@ -18,36 +18,42 @@
 #
 ###########################################################################
 
-"""Module that defines the colab parameters"""
+"""Module that defines the colab parameters.
+
+Parameters can be set via environment variables (for Cloud Run deployment)
+or directly in this file (for local/Colab use).
+"""
+
+import os
 
 # @markdown ### Google Cloud Project Details
 
-PROJECT_ID = "" # @param {type:"string"}
-BUCKET_NAME = "" # @param {type:"string"}
+PROJECT_ID = os.environ.get("PROJECT_ID", "") # @param {type:"string"}
+BUCKET_NAME = os.environ.get("BUCKET_NAME", "") # @param {type:"string"}
 
 
 # @markdown ### Solution Setup
 
-VIDEO_SIZE_LIMIT_MB = 7  # @param {type:"number"}
-VERBOSE = True  # @param {type:"boolean"}
-use_llms = True  # @param {type:"boolean"}
-use_annotations = True # @param {type:"boolean"}
+VIDEO_SIZE_LIMIT_MB = int(os.environ.get("VIDEO_SIZE_LIMIT_MB", "7"))  # @param {type:"number"}
+VERBOSE = os.environ.get("VERBOSE", "true").lower() == "true"  # @param {type:"boolean"}
+use_llms = os.environ.get("USE_LLMS", "true").lower() == "true"  # @param {type:"boolean"}
+use_annotations = os.environ.get("USE_ANNOTATIONS", "true").lower() == "true" # @param {type:"boolean"}
 # For local testing outside colab ONLY, set to False for colab
-STORE_TEST_RESULTS = False
+STORE_TEST_RESULTS = os.environ.get("STORE_TEST_RESULTS", "false").lower() == "true"
 TEST_RESULTS = []
 
 # @markdown #### Knowledge Graph API Configuration
 
-KNOWLEDGE_GRAPH_API_KEY = ""  # @param {type:"string"}
+KNOWLEDGE_GRAPH_API_KEY = os.environ.get("KNOWLEDGE_GRAPH_API_KEY", "")  # @param {type:"string"}
 
 
 # @markdown ### Brand and Product Details
 
-brand_name = "Google"  # @param {type:"string"}
-brand_variations_str = "google"  # @param {type:"string"}
-branded_products_str = "Google pixel, Google pixel buds, Google pixel watch"  # @param {type:"string"}
-branded_products_categories_str = "phone, watch, buds"  # @param {type:"string"}
-branded_call_to_actions_str = "buy it!"  # @param {type:"string"}
+brand_name = os.environ.get("BRAND_NAME", "Google")  # @param {type:"string"}
+brand_variations_str = os.environ.get("BRAND_VARIATIONS", "google")  # @param {type:"string"}
+branded_products_str = os.environ.get("BRANDED_PRODUCTS", "Google pixel, Google pixel buds, Google pixel watch")  # @param {type:"string"}
+branded_products_categories_str = os.environ.get("BRANDED_PRODUCTS_CATEGORIES", "phone, watch, buds")  # @param {type:"string"}
+branded_call_to_actions_str = os.environ.get("BRANDED_CALL_TO_ACTIONS", "buy it!")  # @param {type:"string"}
 
 
 # @markdown ### ABCD Framework Details

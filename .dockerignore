@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+*.ipynb
+test_results/
+venv/
+.env
+*.md
+LICENSE
