@@ -1,0 +1,367 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PROJECT_ID: abcds-detector-488021
+  REGION: us-central1
+  SERVICE_NAME: creative-reviewer
+  STAGING_SERVICE_NAME: creative-reviewer-staging
+  REPOSITORY: creative-reviewer
+  IMAGE: us-central1-docker.pkg.dev/abcds-detector-488021/creative-reviewer/app
+
+jobs:
+  # ──────────────────────────────────────────────
+  # CI: runs on all pushes and PRs
+  # ──────────────────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Ruff lint
+        run: ruff check .
+      - name: Ruff format check
+        run: ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+      - name: Run tests
+        env:
+          DATABASE_URL: sqlite:///data/app.db
+        run: pytest tests/ -v --tb=short -x
+
+  # ──────────────────────────────────────────────
+  # Build: only on main, after CI passes
+  # ──────────────────────────────────────────────
+  build-and-push:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - id: meta
+        name: Set image tag
+        run: echo "image_tag=${{ env.IMAGE }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ──────────────────────────────────────────────
+  # Staging
+  # ──────────────────────────────────────────────
+  migrate-staging:
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Run Alembic migrations (staging)
+        run: |
+          gcloud run jobs execute alembic-migrate-staging \
+            --region ${{ env.REGION }} \
+            --wait \
+            --args="upgrade,head" \
+            --quiet \
+          || echo "::warning::Migration job not found or failed — ensure 'alembic-migrate-staging' Cloud Run job exists"
+
+  deploy-staging:
+    needs: [migrate-staging]
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      staging_url: ${{ steps.get-url.outputs.url }}
+    steps:
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to Cloud Run (staging)
+        run: |
+          gcloud run deploy ${{ env.STAGING_SERVICE_NAME }} \
+            --image "${{ env.IMAGE }}:${{ github.sha }}" \
+            --region ${{ env.REGION }} \
+            --platform managed \
+            --cpu 4 \
+            --memory 4Gi \
+            --concurrency 4 \
+            --min-instances 0 \
+            --max-instances 3 \
+            --timeout 1500 \
+            --add-cloudsql-instances abcds-detector-488021:us-central1:creative-reviewer-db \
+            --vpc-connector cr-vpc-connector \
+            --vpc-egress private-ranges-only \
+            --service-account abcds-detector-sa@abcds-detector-488021.iam.gserviceaccount.com \
+            --set-env-vars "ENVIRONMENT=staging,PUBLIC_BASE_URL=${{ secrets.STAGING_PUBLIC_BASE_URL }}"
+            --set-secrets "\
+              SESSION_SECRET=SESSION_SECRET:latest,\
+              GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID:latest,\
+              GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,\
+              STRIPE_SECRET_KEY=STRIPE_SECRET_KEY:latest,\
+              STRIPE_WEBHOOK_SECRET=STRIPE_WEBHOOK_SECRET:latest,\
+              STRIPE_PRICE_1000=STRIPE_PRICE_1000:latest,\
+              STRIPE_PRICE_3000=STRIPE_PRICE_3000:latest,\
+              DATABASE_URL=STAGING_DATABASE_URL:latest,\
+              ABCD_KG_API_KEY=ABCD_KG_API_KEY:latest,\
+              SLACK_WEBHOOK_URL=SLACK_WEBHOOK_URL:latest" \
+            --allow-unauthenticated \
+            --quiet
+
+      - id: get-url
+        name: Get staging URL
+        run: |
+          URL=$(gcloud run services describe ${{ env.STAGING_SERVICE_NAME }} \
+            --region ${{ env.REGION }} \
+            --format 'value(status.url)')
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "### 🚀 Staging deployed to: $URL" >> "$GITHUB_STEP_SUMMARY"
+
+  smoke-test-staging:
+    needs: [deploy-staging]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Health check (staging)
+        run: |
+          URL="${{ needs.deploy-staging.outputs.staging_url }}"
+          echo "Checking health at $URL/health ..."
+          for i in $(seq 1 12); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Staging health check passed"
+              exit 0
+            fi
+            echo "Attempt $i: status=$STATUS, retrying in 5s..."
+            sleep 5
+          done
+          echo "❌ Staging health check failed after 60s"
+          exit 1
+
+  # ──────────────────────────────────────────────
+  # Production (requires manual approval)
+  # ──────────────────────────────────────────────
+  migrate-production:
+    needs: [smoke-test-staging]
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Run Alembic migrations (production)
+        run: |
+          gcloud run jobs execute alembic-migrate-production \
+            --region ${{ env.REGION }} \
+            --wait \
+            --args="upgrade,head" \
+            --quiet \
+          || echo "::warning::Migration job not found or failed — ensure 'alembic-migrate-production' Cloud Run job exists"
+
+  deploy-production:
+    needs: [migrate-production]
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      prod_url: ${{ steps.get-url.outputs.url }}
+      previous_revision: ${{ steps.save-revision.outputs.revision }}
+    steps:
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - id: save-revision
+        name: Save current revision for rollback
+        run: |
+          REVISION=$(gcloud run revisions list \
+            --service=${{ env.SERVICE_NAME }} \
+            --region=${{ env.REGION }} \
+            --format='value(REVISION)' \
+            --limit=1 \
+            --sort-by='~creationTimestamp' 2>/dev/null || echo "")
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+          echo "Current production revision: $REVISION"
+
+      - name: Deploy to Cloud Run (production)
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image "${{ env.IMAGE }}:${{ github.sha }}" \
+            --region ${{ env.REGION }} \
+            --platform managed \
+            --cpu 4 \
+            --memory 4Gi \
+            --concurrency 4 \
+            --min-instances 1 \
+            --max-instances 10 \
+            --timeout 1500 \
+            --add-cloudsql-instances abcds-detector-488021:us-central1:creative-reviewer-db \
+            --vpc-connector cr-vpc-connector \
+            --vpc-egress private-ranges-only \
+            --service-account abcds-detector-sa@abcds-detector-488021.iam.gserviceaccount.com \
+            --set-env-vars "ENVIRONMENT=production,PUBLIC_BASE_URL=${{ secrets.PUBLIC_BASE_URL }}"
+            --set-secrets "\
+              SESSION_SECRET=SESSION_SECRET:latest,\
+              GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID:latest,\
+              GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,\
+              STRIPE_SECRET_KEY=STRIPE_SECRET_KEY:latest,\
+              STRIPE_WEBHOOK_SECRET=STRIPE_WEBHOOK_SECRET:latest,\
+              STRIPE_PRICE_1000=STRIPE_PRICE_1000:latest,\
+              STRIPE_PRICE_3000=STRIPE_PRICE_3000:latest,\
+              DATABASE_URL=DATABASE_URL:latest,\
+              ABCD_KG_API_KEY=ABCD_KG_API_KEY:latest,\
+              SLACK_WEBHOOK_URL=SLACK_WEBHOOK_URL:latest" \
+            --allow-unauthenticated \
+            --quiet
+
+      - id: get-url
+        name: Get production URL
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region ${{ env.REGION }} \
+            --format 'value(status.url)')
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "### 🚀 Production deployed to: $URL" >> "$GITHUB_STEP_SUMMARY"
+
+  smoke-test-production:
+    needs: [deploy-production]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Health check (production)
+        id: health
+        run: |
+          URL="${{ needs.deploy-production.outputs.prod_url }}"
+          echo "Checking health at $URL/health ..."
+          for i in $(seq 1 12); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Production health check passed"
+              echo "healthy=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Attempt $i: status=$STATUS, retrying in 5s..."
+            sleep 5
+          done
+          echo "healthy=false" >> "$GITHUB_OUTPUT"
+          echo "❌ Production health check failed after 60s"
+
+      - id: auth
+        if: steps.health.outputs.healthy == 'false'
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: steps.health.outputs.healthy == 'false'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Rollback to previous revision
+        if: steps.health.outputs.healthy == 'false'
+        run: |
+          PREV="${{ needs.deploy-production.outputs.previous_revision }}"
+          if [ -n "$PREV" ]; then
+            echo "⚠️ Rolling back to revision: $PREV"
+            gcloud run services update-traffic ${{ env.SERVICE_NAME }} \
+              --region ${{ env.REGION }} \
+              --to-revisions "$PREV=100" \
+              --quiet
+            echo "### ⚠️ Production rolled back to $PREV" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::No previous revision found for rollback"
+          fi
+          exit 1

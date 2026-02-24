@@ -145,6 +145,9 @@ class Render(Base):
   pipeline_version = Column(String, nullable=True)
   model = Column(String, nullable=True)
 
+  render_factor = Column(Float, nullable=True, default=23.0)
+  estimated_render_seconds = Column(Integer, nullable=True)
+
   tokens_estimated = Column(Integer, nullable=True)
   tokens_used = Column(Integer, nullable=True)
 
