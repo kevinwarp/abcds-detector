@@ -153,3 +153,29 @@ The container runs `uvicorn web_app:app` on port 8080 with a health check at `/h
 - **Creative providers:** Implement `creative_provider_proto.CreativeProviderProto` and register in `creative_provider_registry.py`
 - **Custom evaluation:** Add custom eval functions in `custom_evaluation/` that return the standard `VIDEO_RESPONSE_SCHEMA` format
 - **Feature grouping:** Features can be grouped by `full_video` or `first_5_secs_video` for batched LLM calls, or set to `no_grouping` for individual evaluation
+
+## Code Style Conventions
+
+- **License header:** Apache 2.0 copyright header required on all `.py` files
+- **Indentation:** 2 spaces (not 4)
+- **Line length:** 80 characters max
+- **Quotes:** Majority-rules (via pyink)
+- **Docstrings:** Google style
+- **Type hints:** Expected on function signatures
+- **Naming:** modules `snake_case.py`, classes `PascalCase`, functions/vars `snake_case`, constants `UPPER_SNAKE_CASE`
+- **Commits:** Conventional Commits format — `type(scope): message` (e.g. `feat(abcd): add Shorts evaluation`)
+
+## Pre-commit Hooks
+
+```bash
+pre-commit install          # set up hooks
+pre-commit run --all-files  # run manually
+```
+
+Configured hooks include: copyright header checks, ruff, pyink, pylint, pytype, mdformat, commitizen, trailing whitespace, JSON/YAML validation.
+
+## CI/CD
+
+GitHub Actions workflows in `.github/workflows/`:
+- **ci.yml** — runs ruff lint/format checks and pytest on every PR
+- **deploy.yml** — deploys to Google Cloud Run on pushes to main
