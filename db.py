@@ -31,7 +31,11 @@ _is_sqlite = DATABASE_URL.startswith("sqlite")
 
 # Configure engine with appropriate pooling per backend
 if _is_sqlite:
-  engine = create_engine(DATABASE_URL, echo=False)
+  engine = create_engine(
+      DATABASE_URL,
+      echo=False,
+      connect_args={"check_same_thread": False},
+  )
 
   @event.listens_for(engine, "connect")
   def _set_sqlite_pragma(dbapi_conn, _):

@@ -220,7 +220,7 @@
     <!-- Loading state -->
     <div id="loadingState" style="padding:24px">
       <table><thead><tr>
-        <th style="width:32px"></th><th>Preview</th><th>Render ID</th><th>Status</th><th>User</th><th>Created</th><th>Dur / Size</th><th>Pipeline</th><th>Credits</th><th>Source</th><th>Report</th><th>Slack</th><th>Output</th><th></th>
+        <th style="width:32px"></th><th>Preview</th><th>Render ID</th><th>Status</th><th>User</th><th>Created</th><th>Dur / Size</th><th>Pipeline</th><th>Credits</th><th>Asset URL</th><th>Report URL</th><th>Slack</th><th>Output</th><th></th>
       </tr></thead><tbody id="skeletonBody"></tbody></table>
     </div>
 
@@ -252,8 +252,8 @@
           <th id="thDuration" data-sort="duration_seconds">Dur / Size</th>
           <th>Pipeline</th>
           <th id="thCredits" data-sort="tokens_used">Credits</th>
-          <th>Source</th>
-          <th>Report</th>
+          <th>Asset URL</th>
+          <th>Report URL</th>
           <th>Slack</th>
           <th>Output</th>
           <th style="width:40px"></th>
@@ -488,11 +488,11 @@ function renderTable() {
     const credits = r.tokens_used != null ? `${r.tokens_used}` : '—';
     const estCredits = r.tokens_estimated != null ? ` / ~${r.tokens_estimated}` : '';
     const sourceIcon = r.source_type === 'upload' ? '📤' : r.source_type === 'url' ? '🔗' : '⚡';
-    const isSourceUrl = r.source_ref && (r.source_ref.startsWith('http') || r.source_ref.startsWith('gs://') || r.source_ref.includes('youtube.com') || r.source_ref.includes('youtu.be'));
-    const sourceRef = r.source_ref
-      ? (isSourceUrl ? `<a href="${r.source_ref}" target="_blank" style="color:var(--purple);text-decoration:none" title="${r.source_ref}">${truncate(r.source_ref, 20)}</a>` : truncate(r.source_ref, 20))
+    const assetUrl = r.asset_url || r.prompt_text || '';
+    const assetHtml = assetUrl
+      ? `<a href="${assetUrl.startsWith('gs://') ? '#' : assetUrl}" ${assetUrl.startsWith('gs://') ? '' : 'target="_blank"'} style="color:var(--purple);text-decoration:none;font-size:12px" title="${escHtml(assetUrl)}">${sourceIcon} ${truncate(assetUrl.split('/').pop() || assetUrl, 24)}</a> <button class="copy-btn" data-copy="${escHtml(assetUrl)}" title="Copy asset URL">📋</button>`
       : '—';
-    const reportHtml = r.report_url ? `<a href="${r.report_url}" target="_blank" style="color:var(--purple);text-decoration:none;font-size:12px" title="${r.report_url}">View Report</a>` : '—';
+    const reportHtml = r.report_url ? `<a href="${r.report_url}" target="_blank" style="color:var(--purple);text-decoration:none;font-size:12px" title="${r.report_url}">View Report</a> <button class="copy-btn" data-copy="${r.report_url}" title="Copy report URL">📋</button>` : '—';
     const slackHtml = r.slack_notified ? '<span style="color:var(--green);font-size:12px">✓ Sent</span>' : '<span style="color:var(--text2);font-size:12px">—</span>';
     const outputHtml = r.output_url ? `<a href="${r.output_url}" target="_blank" class="dl-btn" title="Download">⬇</a>` : '—';
     const thumbHtml = r.thumbnail_url ? `<div class="thumb"><img src="${r.thumbnail_url}" alt=""></div>` : `<div class="thumb">▶</div>`;
@@ -510,7 +510,7 @@ function renderTable() {
       <td>${dur} / ${size}</td>
       <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis" title="${r.pipeline_version || ''}">${r.pipeline_version || '—'}</td>
       <td>${credits}${estCredits}</td>
-      <td>${sourceIcon} ${sourceRef}</td>
+      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${assetHtml}</td>
       <td>${reportHtml}</td>
       <td>${slackHtml}</td>
       <td>${outputHtml}</td>
@@ -792,9 +792,12 @@ function renderDetailActions(d) {
 
 function renderDetailTabs(d) {
   // Summary
+  const detailAssetUrl = d.asset_url || d.prompt_text || '';
   $('pane-summary').innerHTML = `
     ${field('Render ID', d.render_id)}
     ${field('Status', `<span class="pill pill-${d.status}">${d.status}</span>` + (d.progress_pct != null && d.status === 'rendering' ? ` (${d.progress_pct}%)` : ''))}
+    ${field('Report URL', d.report_url ? `<a href="${d.report_url}" target="_blank" style="color:var(--purple)">${d.report_url}</a> <button class="copy-btn" data-copy="${d.report_url}" title="Copy report URL" style="margin-left:6px">📋</button>` : '—')}
+    ${field('Asset URL', detailAssetUrl ? `<a href="${detailAssetUrl.startsWith('gs://') ? '#' : detailAssetUrl}" ${detailAssetUrl.startsWith('gs://') ? '' : 'target="_blank"'} style="color:var(--purple);word-break:break-all">${escHtml(detailAssetUrl)}</a> <button class="copy-btn" data-copy="${escHtml(detailAssetUrl)}" title="Copy asset URL" style="margin-left:6px">📋</button>` : '—')}
     ${field('User', `${d.user_name || ''} &lt;${d.user_email || ''}&gt;`)}
     ${field('Created', d.created_at || '—')}
     ${field('Started', d.started_at || '—')}
@@ -805,7 +808,6 @@ function renderDetailTabs(d) {
     ${field('File Size', d.file_size_mb != null ? `${d.file_size_mb} MB` : '—')}
     ${field('Model', d.model || '—')}
     ${field('Pipeline', d.pipeline_version || '—')}
-    ${field('Report URL', d.report_url ? `<a href="${d.report_url}" target="_blank" style="color:var(--purple)">${d.report_url}</a>` : '—')}
     ${field('Slack Notified', d.slack_notified ? '<span style="color:var(--green)">✓ Sent</span>' : '—')}
     ${d.error_code ? field('Error', `<span style="color:var(--red)">${d.error_code}: ${d.error_message || ''}</span>`) : ''}
   `;

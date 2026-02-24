@@ -8,6 +8,7 @@ import os
 import queue
 import re
 import threading
+import urllib.request
 import uuid
 import asyncio
 import logging
@@ -36,6 +37,7 @@ import platform_optimizer
 import reference_library
 import report_service
 import scene_detector
+import notification_service
 from configuration import Configuration
 from evaluation_services import video_evaluation_service
 from evaluation_services import confidence_calibration_service
@@ -90,6 +92,14 @@ if _is_production:
   _logging_mod.root.setLevel(_logging_mod.INFO)
 else:
   logging.basicConfig(level=logging.INFO)
+
+# Attach Slack error handler — sends ERROR/CRITICAL logs to Slack.
+import error_logging
+_slack_err = error_logging.install()
+if _slack_err:
+  logging.info("Slack error logging enabled")
+else:
+  logging.warning("SLACK_ERROR_WEBHOOK_URL not set — Slack error alerts disabled")
 
 app = FastAPI(
     title="AI Creative Review",
@@ -213,6 +223,51 @@ def _send_slack_notification(results: dict, report_url: str) -> None:
       report_service.send_slack_notification(results, report_url, SLACK_WEBHOOK_URL)
     except Exception as ex:
       logging.error("Slack notification failed: %s", ex)
+  threading.Thread(target=_send, daemon=True).start()
+
+
+def _send_upload_slack_notification(
+    user_email: str, filename: str, size_mb: float, gcs_uri: str,
+) -> None:
+  """Send Slack notification when a video is uploaded (fire-and-forget).
+
+  No-op if SLACK_WEBHOOK_URL is not configured.
+  """
+  if not SLACK_WEBHOOK_URL:
+    return
+  def _send():
+    try:
+      payload = {
+          "text": f"\U0001f4e4 Video uploaded by {user_email}: {filename} ({size_mb} MB)",
+          "blocks": [
+              {
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": (
+                          f":inbox_tray: *New Video Upload*\n"
+                          f"*User:* {user_email}\n"
+                          f"*File:* {filename}\n"
+                          f"*Size:* {size_mb} MB\n"
+                          f"*GCS:* `{gcs_uri}`"
+                      ),
+                  },
+              },
+          ],
+          "unfurl_links": False,
+      }
+      body = json.dumps(payload).encode("utf-8")
+      req = urllib.request.Request(
+          SLACK_WEBHOOK_URL,
+          data=body,
+          headers={"Content-Type": "application/json"},
+          method="POST",
+      )
+      with urllib.request.urlopen(req, timeout=10) as resp:
+        if resp.status != 200:
+          logging.warning("Upload Slack webhook returned status %d", resp.status)
+    except Exception as ex:
+      logging.error("Upload Slack notification failed: %s", ex)
   threading.Thread(target=_send, daemon=True).start()
 
 PRO_MODEL = "gemini-2.5-pro"
@@ -463,7 +518,7 @@ def run_evaluation(
           shorts = result
         elif key == "ci":
           creative_intel = result
-          ci_detected = sum(1 for f in result if f.evaluation)
+          ci_detected = sum(1 for f in result if f.detected)
           ci_density = round(ci_detected / len(result) * 100) if result else 0
           progress("ci_done", "Creative intelligence complete", 60,
                    partial={"persuasion": {"density": ci_density, "detected": ci_detected, "total": len(result)}})
@@ -996,6 +1051,10 @@ async def serve_admin(
   return HTMLResponse(content=html_path.read_text())
 
 
+# Allowed video file extensions
+_ALLOWED_VIDEO_EXTENSIONS = {".mp4"}
+
+
 @app.post("/api/upload", response_model=None)
 @limiter.limit("10/minute")
 async def upload_video(
@@ -1004,6 +1063,23 @@ async def upload_video(
     current_user: User = Depends(get_current_user),
 ):
   """Upload a video file to GCS with size and credit pre-checks."""
+  # File type check
+  filename = (file.filename or "").lower()
+  ext = Path(filename).suffix
+  if ext not in _ALLOWED_VIDEO_EXTENSIONS:
+    hint = f"Unsupported file format ({ext or 'unknown'}). Only .mp4 files are supported."
+    if ext == ".mov":
+      hint = (
+          ".mov files are not supported. Please convert to .mp4 first — "
+          "you can use FFmpeg: ffmpeg -i video.mov -c:v libx264 -c:a aac output.mp4"
+      )
+    elif ext in (".avi", ".webm", ".mkv", ".flv", ".wmv"):
+      hint = f"{ext} files are not supported. Please convert to .mp4 first using FFmpeg or a free online converter."
+    return JSONResponse(
+        {"error": "unsupported_format", "message": hint},
+        status_code=415,
+    )
+
   # Read file content
   content = await file.read()
   file_size_bytes = len(content)
@@ -1049,6 +1125,13 @@ async def upload_video(
   # Clean up local temp file
   tmp_path.unlink(missing_ok=True)
 
+  _send_upload_slack_notification(
+      user_email=current_user.email,
+      filename=safe_name,
+      size_mb=round(file_size_mb, 1),
+      gcs_uri=gcs_uri,
+  )
+
   return JSONResponse({
       "status": "uploaded",
       "filename": safe_name,
@@ -1071,9 +1154,9 @@ async def evaluate_video(
   """Run ABCD evaluation with SSE progress streaming.
 
   Enforces credit balance and concurrent job limits.
-  Credits are deducted based on max video duration (60s) upfront;
-  for URL-based evaluations where duration is unknown, we charge
-  the maximum and could refund the difference in a future iteration.
+  Credits are deducted AFTER a successful render, based on the
+  actual video duration in seconds (10 tokens/sec).  Failed
+  evaluations are not charged.
   """
   # Credit balance check — user needs at least MIN_TOKENS_TO_RENDER to start
   if current_user.credits_balance < credits_mod.MIN_TOKENS_TO_RENDER:
@@ -1102,12 +1185,9 @@ async def evaluate_video(
   user_id = current_user.id
   user_email = current_user.email
 
-  # Deduct max credits upfront
+  # Credits are deducted AFTER the render succeeds, based on actual
+  # video duration.  We only gate on MIN_TOKENS_TO_RENDER above.
   report_id = str(uuid.uuid4())[:8]
-  tokens_used = credits_mod.deduct_credits(
-      db, current_user, credits_mod.MAX_VIDEO_SECONDS, job_id=report_id,
-  )
-  credits_after_deduct = current_user.credits_balance
 
   provider_type = "YOUTUBE" if "youtube.com" in gcs_uri or "youtu.be" in gcs_uri else "GCS"
   source_type = "url" if provider_type == "YOUTUBE" else "upload"
@@ -1118,7 +1198,7 @@ async def evaluate_video(
       provider_type=provider_type,
   )
 
-  # Persist render row
+  # Persist render row (tokens_used filled in after success)
   render_row = Render(
       render_id=report_id,
       status="rendering",
@@ -1133,7 +1213,7 @@ async def evaluate_video(
       pipeline_version="Gemini → FFmpeg → Encode v3",
       model=PRO_MODEL,
       tokens_estimated=credits_mod.MAX_TOKENS_PER_VIDEO,
-      tokens_used=tokens_used,
+      tokens_used=0,
   )
   db.add(render_row)
   db.commit()
@@ -1149,10 +1229,13 @@ async def evaluate_video(
   def _run():
     return run_evaluation(gcs_uri, config, on_progress=on_progress)
 
+  EVALUATION_TIMEOUT_SECONDS = 300  # 5 minutes
+
   async def event_stream():
     loop = asyncio.get_event_loop()
     task = loop.run_in_executor(None, _run)
     results = None
+    start_time = asyncio.get_event_loop().time()
 
     try:
       while True:
@@ -1176,67 +1259,136 @@ async def evaluate_video(
             return
           break
 
+        # Check for timeout
+        elapsed = asyncio.get_event_loop().time() - start_time
+        if elapsed >= EVALUATION_TIMEOUT_SECONDS:
+          logging.error(
+              "Evaluation timed out after %d seconds for render %s",
+              EVALUATION_TIMEOUT_SECONDS, report_id,
+          )
+          task.cancel()
+          # Mark render row as failed
+          try:
+            _db_timeout = next(get_db())
+            _r_timeout = _db_timeout.query(Render).filter(Render.render_id == report_id).first()
+            if _r_timeout:
+              _r_timeout.status = "failed"
+              _r_timeout.finished_at = datetime.datetime.utcnow()
+              _db_timeout.commit()
+            _db_timeout.close()
+          except Exception as ex:
+            logging.error("Failed to update render row on timeout: %s", ex)
+          yield f"data: {json.dumps({'step': 'error', 'message': 'This asset took too long to process. Please try again or use a shorter video.'})}\n\n"
+          return
+
         await asyncio.sleep(0.3)
 
-      # Finalize: assign report ID, cache, notify
-      results["report_id"] = report_id
-      results["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
-      results["tokens_used"] = tokens_used
-      results["credits_remaining"] = credits_after_deduct
-      results["user_email"] = user_email
-      results_store[report_id] = results
-      _save_results_to_gcs(report_id, results)
-
-      # Log scores for benchmark history
+      # ---- Post-success: finalize results and send complete event ----
       try:
-        benchmarking.log_evaluation(
-            report_id=report_id,
-            abcd_score=results.get("abcd", {}).get("score", 0),
-            persuasion_density=results.get("persuasion", {}).get("density", 0),
-            performance_score=results.get("predictions", {}).get("overall_score", 0),
-            vertical=results.get("brand_intelligence", {}).get("product_service", ""),
+        actual_dur = credits_mod.get_actual_duration(results)
+        if actual_dur is None:
+          # Fallback: use max duration if we cannot determine actual
+          actual_dur = float(credits_mod.MAX_VIDEO_SECONDS)
+          logging.warning(
+              "Could not determine actual duration for %s — charging max (%ds)",
+              report_id, credits_mod.MAX_VIDEO_SECONDS,
+          )
+        tokens_used = 0
+        credits_remaining = 0
+        try:
+          _db2 = next(get_db())
+          _user = _db2.query(User).filter(User.id == user_id).first()
+          if _user:
+            tokens_used = credits_mod.deduct_credits(
+                _db2, _user, actual_dur, job_id=report_id,
+            )
+            credits_remaining = _user.credits_balance
+          _db2.close()
+        except Exception as ex:
+          logging.error("Post-success credit deduction failed: %s", ex)
+
+        # Finalize: assign report ID, cache, notify
+        results["report_id"] = report_id
+        results["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+        results["tokens_used"] = tokens_used
+        results["credits_remaining"] = credits_remaining
+        results["duration_seconds"] = actual_dur
+        results["user_email"] = user_email
+        results_store[report_id] = results
+        _save_results_to_gcs(report_id, results)
+
+        # Log scores for benchmark history
+        try:
+          benchmarking.log_evaluation(
+              report_id=report_id,
+              abcd_score=results.get("abcd", {}).get("score", 0),
+              persuasion_density=results.get("persuasion", {}).get("density", 0),
+              performance_score=results.get("predictions", {}).get("overall_score", 0),
+              vertical=results.get("brand_intelligence", {}).get("product_service", ""),
+          )
+        except Exception as ex:
+          logging.error("Benchmark logging failed: %s", ex)
+
+        # Build report URL before updating the render row
+        base_url = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+        report_url = f"{base_url}/report/{report_id}"
+        results["report_url"] = report_url
+
+        # Update render row → succeeded
+        try:
+          _db = next(get_db())
+          _r = _db.query(Render).filter(Render.render_id == report_id).first()
+          if _r:
+            _r.status = "succeeded"
+            _r.progress_pct = 100
+            _r.finished_at = datetime.datetime.utcnow()
+            _r.output_url = report_url
+            _r.duration_seconds = actual_dur
+            _r.file_size_mb = results.get("file_size_mb")
+            _r.tokens_used = tokens_used
+            _db.commit()
+          _db.close()
+        except Exception as ex:
+          logging.error("Render row update failed: %s", ex)
+
+        _send_slack_notification(results, report_url)
+        slack_sent = bool(SLACK_WEBHOOK_URL)
+
+        # Record Slack notification status
+        try:
+          _db = next(get_db())
+          _r = _db.query(Render).filter(Render.render_id == report_id).first()
+          if _r:
+            _r.slack_notified = slack_sent
+            _db.commit()
+          _db.close()
+        except Exception as ex:
+          logging.error("Slack status update failed: %s", ex)
+
+        yield f"data: {json.dumps({'step': 'complete', 'pct': 100, 'data': results}, default=str)}\n\n"
+      except Exception as post_ex:
+        logging.error(
+            "Post-success processing failed for render %s: %s",
+            report_id, post_ex, exc_info=True,
         )
-      except Exception as ex:
-        logging.error("Benchmark logging failed: %s", ex)
-
-      # Build report URL before updating the render row
-      base_url = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
-      report_url = f"{base_url}/report/{report_id}"
-      results["report_url"] = report_url
-
-      # Update render row → succeeded
-      try:
-        _db = next(get_db())
-        _r = _db.query(Render).filter(Render.render_id == report_id).first()
-        if _r:
-          _r.status = "succeeded"
-          _r.progress_pct = 100
-          _r.finished_at = datetime.datetime.utcnow()
-          _r.output_url = report_url
-          _r.duration_seconds = results.get("video_metadata", {}).get("duration")
-          _r.file_size_mb = results.get("file_size_mb")
-          _db.commit()
-        _db.close()
-      except Exception as ex:
-        logging.error("Render row update failed: %s", ex)
-
-      _send_slack_notification(results, report_url)
-      slack_sent = bool(SLACK_WEBHOOK_URL)
-
-      # Record Slack notification status
-      try:
-        _db = next(get_db())
-        _r = _db.query(Render).filter(Render.render_id == report_id).first()
-        if _r:
-          _r.slack_notified = slack_sent
-          _db.commit()
-        _db.close()
-      except Exception as ex:
-        logging.error("Slack status update failed: %s", ex)
-
-      yield f"data: {json.dumps({'step': 'complete', 'pct': 100, 'data': results}, default=str)}\n\n"
+        yield f"data: {json.dumps({'step': 'error', 'message': f'Evaluation succeeded but post-processing failed: {post_ex}'})}\n\n"
     finally:
       credits_mod.release_job_slot(user_id)
+      # Mark render as failed if it's still in a non-terminal state
+      # (e.g. client disconnect, unexpected error)
+      try:
+        _db_fin = next(get_db())
+        _r_fin = _db_fin.query(Render).filter(Render.render_id == report_id).first()
+        if _r_fin and _r_fin.status in ("queued", "rendering"):
+          _r_fin.status = "failed"
+          _r_fin.finished_at = datetime.datetime.utcnow()
+          _r_fin.error_code = "STREAM_INTERRUPTED"
+          _r_fin.error_message = "Render interrupted (client disconnect or unexpected error)"
+          _db_fin.commit()
+          logging.warning("Marked interrupted render %s as failed", report_id)
+        _db_fin.close()
+      except Exception as ex:
+        logging.error("Failed to mark interrupted render %s as failed: %s", report_id, ex)
 
   return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -1395,8 +1547,12 @@ async def evaluate_file(
   Enforces:
   - 50MB file size limit
   - 60s video duration limit
-  - Credit balance check (10 tokens/sec)
+  - Credit balance check (minimum tokens required)
   - 1 concurrent upload per user
+
+  Credits are deducted AFTER a successful render, based on the
+  actual video duration in seconds (10 tokens/sec).  Failed
+  evaluations are not charged.
   """
   try:
     # Concurrent upload limit
@@ -1407,6 +1563,23 @@ async def evaluate_file(
       )
 
     try:
+      # Step 0: File type check
+      _fname = (file.filename or "").lower()
+      _ext = Path(_fname).suffix
+      if _ext not in _ALLOWED_VIDEO_EXTENSIONS:
+        hint = f"Unsupported file format ({_ext or 'unknown'}). Only .mp4 files are supported."
+        if _ext == ".mov":
+          hint = (
+              ".mov files are not supported. Please convert to .mp4 first — "
+              "you can use FFmpeg: ffmpeg -i video.mov -c:v libx264 -c:a aac output.mp4"
+          )
+        elif _ext in (".avi", ".webm", ".mkv", ".flv", ".wmv"):
+          hint = f"{_ext} files are not supported. Please convert to .mp4 first using FFmpeg or a free online converter."
+        return JSONResponse(
+            {"error": "unsupported_format", "message": hint},
+            status_code=415,
+        )
+
       # Step 1: Save file locally
       logging.info(f"Received file: {file.filename} ({file.content_type})")
       raw_name = Path(file.filename or "upload.mp4").name
@@ -1444,13 +1617,10 @@ async def evaluate_file(
         status_code = validation_error.pop("status_code", 400)
         return JSONResponse(validation_error, status_code=status_code)
 
-      # Step 3: Deduct credits before processing
+      # Credits are deducted AFTER render success using actual duration.
       report_id = str(uuid.uuid4())[:8]
-      tokens_used = credits_mod.deduct_credits(
-          db, current_user, duration, job_id=report_id,
-      )
 
-      # Persist render row
+      # Persist render row (tokens_used filled in after success)
       render_row = Render(
           render_id=report_id,
           status="rendering",
@@ -1466,7 +1636,7 @@ async def evaluate_file(
           pipeline_version="Gemini → FFmpeg → Encode v3",
           model=PRO_MODEL,
           tokens_estimated=credits_mod.required_tokens(duration),
-          tokens_used=tokens_used,
+          tokens_used=0,
       )
       db.add(render_row)
       db.commit()
@@ -1478,6 +1648,18 @@ async def evaluate_file(
 
       # Clean up local file
       tmp_path.unlink(missing_ok=True)
+
+      # Send Slack notification in background
+      def _notify():
+        try:
+          if notification_service.notify_evaluation_started(
+              report_id, current_user.email, safe_name
+          ):
+            render_row.slack_notified = True
+            db.commit()
+        except Exception as ex:
+          logging.error("Failed to send evaluation started notification: %s", ex)
+      threading.Thread(target=_notify, daemon=True).start()
 
       # Step 5: Run evaluation
       logging.info(f"Starting evaluation for {gcs_uri}...")
@@ -1498,12 +1680,18 @@ async def evaluate_file(
           None,  # No progress callback for direct API
       )
 
-      # Step 6: Finalize results
+      # Step 6: Deduct credits now that render succeeded
+      actual_dur = credits_mod.get_actual_duration(results) or duration
+      tokens_used = credits_mod.deduct_credits(
+          db, current_user, actual_dur, job_id=report_id,
+      )
+
       results["report_id"] = report_id
       results["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
       results["file_size_mb"] = round(file_size_mb, 2)
       results["tokens_used"] = tokens_used
       results["credits_remaining"] = current_user.credits_balance
+      results["duration_seconds"] = actual_dur
       results["user_email"] = current_user.email
 
       # Store in cache for later retrieval
@@ -1521,6 +1709,8 @@ async def evaluate_file(
         render_row.progress_pct = 100
         render_row.finished_at = datetime.datetime.utcnow()
         render_row.output_url = report_url
+        render_row.duration_seconds = actual_dur
+        render_row.tokens_used = tokens_used
         db.commit()
       except Exception as ex:
         logging.error("Render row update failed: %s", ex)
@@ -1542,6 +1732,15 @@ async def evaluate_file(
 
   except Exception as ex:
     logging.error(f"Evaluation failed: {ex}", exc_info=True)
+    # Mark render as failed so it doesn't stay stuck
+    try:
+      render_row.status = "failed"
+      render_row.finished_at = datetime.datetime.utcnow()
+      render_row.error_code = "EVALUATION_ERROR"
+      render_row.error_message = str(ex)[:500]
+      db.commit()
+    except Exception as db_ex:
+      logging.error("Failed to mark render as failed: %s", db_ex)
     return JSONResponse(
         {"error": f"Evaluation failed: {str(ex)}"},
         status_code=500,
@@ -1679,6 +1878,8 @@ async def evaluate_compare(
   loop = asyncio.get_event_loop()
   variant_results = []
 
+  user_id = current_user.id
+
   async def _eval_one(uri: str) -> dict:
     provider_type = "YOUTUBE" if "youtube.com" in uri or "youtu.be" in uri else "GCS"
     config = build_config(
@@ -1689,6 +1890,25 @@ async def evaluate_compare(
     rid = str(uuid.uuid4())[:8]
     result["report_id"] = rid
     result["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+
+    # Deduct credits based on actual duration (only for successful renders)
+    actual_dur = credits_mod.get_actual_duration(result)
+    tokens_used = 0
+    if actual_dur is not None and actual_dur > 0:
+      try:
+        _cdb = next(get_db())
+        _cuser = _cdb.query(User).filter(User.id == user_id).first()
+        if _cuser:
+          tokens_used = credits_mod.deduct_credits(
+              _cdb, _cuser, actual_dur, job_id=rid,
+          )
+          result["credits_remaining"] = _cuser.credits_balance
+        _cdb.close()
+      except Exception as ex:
+        logging.error("Compare credit deduction failed for %s: %s", rid, ex)
+    result["tokens_used"] = tokens_used
+    result["duration_seconds"] = actual_dur
+
     results_store[rid] = result
     _save_results_to_gcs(rid, result)
 
@@ -1702,7 +1922,7 @@ async def evaluate_compare(
   tasks = [_eval_one(uri) for uri in video_uris]
   variant_results = await _aio.gather(*tasks, return_exceptions=True)
 
-  # Filter out failures
+  # Filter out failures — no credits deducted for failed evaluations
   successful = []
   errors = []
   for i, r in enumerate(variant_results):
@@ -1742,11 +1962,54 @@ async def serve_comparison_report(comparison_id: str):
   return HTMLResponse(content=html)
 
 
+# ---------------------------------------------------------------------------
+# Stale render reaper — marks renders stuck in non-terminal states
+# ---------------------------------------------------------------------------
+STALE_RENDER_THRESHOLD_SECONDS = 600  # 10 minutes
+
+
+async def _reap_stale_renders():
+  """Periodically mark renders stuck in 'queued'/'rendering' as failed."""
+  while True:
+    await asyncio.sleep(120)  # check every 2 minutes
+    try:
+      cutoff = datetime.datetime.utcnow() - datetime.timedelta(
+          seconds=STALE_RENDER_THRESHOLD_SECONDS,
+      )
+      db = next(get_db())
+      stale = (
+          db.query(Render)
+          .filter(
+              Render.status.in_(["queued", "rendering"]),
+              Render.started_at < cutoff,
+          )
+          .all()
+      )
+      for r in stale:
+        r.status = "failed"
+        r.finished_at = datetime.datetime.utcnow()
+        r.error_code = "STALE_TIMEOUT"
+        r.error_message = (
+            f"Render was stuck in '{r.status}' for over "
+            f"{STALE_RENDER_THRESHOLD_SECONDS}s and was automatically failed"
+        )
+        logging.warning("Reaped stale render %s (started %s)", r.render_id, r.started_at)
+      if stale:
+        db.commit()
+        logging.info("Reaped %d stale render(s)", len(stale))
+      db.close()
+    except Exception as ex:
+      logging.error("Stale render reaper error: %s", ex)
+
+
 @app.on_event("startup")
 async def _prewarm():
   """Init DB, run auth migrations, and pre-warm Gemini connection on startup."""
   init_db()
   logging.info("Database initialized")
+
+  # Start background reaper for stuck renders
+  asyncio.create_task(_reap_stale_renders())
 
   # Ensure auth columns exist (idempotent)
   try:

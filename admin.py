@@ -56,6 +56,7 @@ def _render_to_dict(r: Render) -> dict:
       "source_ref": r.source_ref,
       "input_assets": json.loads(r.input_assets) if r.input_assets else [],
       "prompt_text": r.prompt_text,
+      "asset_url": r.prompt_text or "",
       "brand_guide": r.brand_guide,
       "config": json.loads(r.config_json) if r.config_json else {},
       "output_url": r.output_url,
