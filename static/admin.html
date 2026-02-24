@@ -488,7 +488,10 @@ function renderTable() {
     const credits = r.tokens_used != null ? `${r.tokens_used}` : '—';
     const estCredits = r.tokens_estimated != null ? ` / ~${r.tokens_estimated}` : '';
     const sourceIcon = r.source_type === 'upload' ? '📤' : r.source_type === 'url' ? '🔗' : '⚡';
-    const sourceRef = r.source_ref ? truncate(r.source_ref, 20) : '—';
+    const isSourceUrl = r.source_ref && (r.source_ref.startsWith('http') || r.source_ref.startsWith('gs://') || r.source_ref.includes('youtube.com') || r.source_ref.includes('youtu.be'));
+    const sourceRef = r.source_ref
+      ? (isSourceUrl ? `<a href="${r.source_ref}" target="_blank" style="color:var(--purple);text-decoration:none" title="${r.source_ref}">${truncate(r.source_ref, 20)}</a>` : truncate(r.source_ref, 20))
+      : '—';
     const reportHtml = r.report_url ? `<a href="${r.report_url}" target="_blank" style="color:var(--purple);text-decoration:none;font-size:12px" title="${r.report_url}">View Report</a>` : '—';
     const slackHtml = r.slack_notified ? '<span style="color:var(--green);font-size:12px">✓ Sent</span>' : '<span style="color:var(--text2);font-size:12px">—</span>';
     const outputHtml = r.output_url ? `<a href="${r.output_url}" target="_blank" class="dl-btn" title="Download">⬇</a>` : '—';

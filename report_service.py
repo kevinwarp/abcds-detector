@@ -2044,6 +2044,7 @@ def _build_slack_blocks(data: dict, report_url: str) -> list[dict]:
   """
   brand = data.get("brand_name", "Unknown")
   video = data.get("video_name", "")
+  video_uri = data.get("video_uri", "")
   abcd = data.get("abcd", {})
   persuasion = data.get("persuasion", {})
   predictions = data.get("predictions", {})
@@ -2058,11 +2059,15 @@ def _build_slack_blocks(data: dict, report_url: str) -> list[dict]:
       "type": "header",
       "text": {"type": "plain_text", "text": "AI Creative Review Complete"},
   })
+  # Make video name clickable if we have a YouTube URL; otherwise link to report
+  is_yt = video_uri and ("youtube.com" in video_uri or "youtu.be" in video_uri)
+  video_link_url = video_uri if is_yt else report_url
+  video_display = f"<{video_link_url}|{video}>" if video_link_url and video else f"`{video}`"
   user_email = data.get("user_email", "")
   user_line = f"\n*Submitted by:* {user_email}" if user_email else ""
   blocks.append({
       "type": "section",
-      "text": {"type": "mrkdwn", "text": f"*Video:* `{video}`  \u2014  *Brand:* {brand}{user_line}"},
+      "text": {"type": "mrkdwn", "text": f"*Video:* {video_display}  \u2014  *Brand:* {brand}{user_line}"},
   })
 
   # --- Scores (single compact block) ---
@@ -2097,9 +2102,9 @@ def _build_slack_blocks(data: dict, report_url: str) -> list[dict]:
       lines.append(f":red_circle: *{ap.get('feature_name', '')}:* {ap.get('recommendation', '')}")
     _slack_section(blocks, _slack_trunc("\n".join(lines), 600))
 
-  # --- Report link ---
+  # --- Report link (show clickable URL) ---
   if report_url:
-    _slack_section(blocks, f":page_facing_up: <{report_url}|*View Full Report*>")
+    _slack_section(blocks, f":page_facing_up: *Report:* <{report_url}|{report_url}>")
 
   return blocks
 
