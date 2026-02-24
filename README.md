@@ -244,3 +244,5 @@ Please follow the steps below before executing the ABCDs Detector solution. Ever
 * [Google Video Intelligence API](https://cloud.google.com/video-intelligence?hl=en)
 * [Vertex AI](https://cloud.google.com/vertex-ai)
 * [ABCD Framework best practices](https://www.thinkwithgoogle.com/intl/en-emea/future-of-marketing/creativity/youtube-video-ad-best-practices/)
+
+# script-writer
