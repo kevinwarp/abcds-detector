@@ -3,13 +3,14 @@
 import json
 from google.cloud import storage
 from configuration import Configuration
+from gcp_api_services.gcp_connection import get_storage_client
 
 
 class GCSAPIService:
   """Service that interacts with the Google Cloud Storage API"""
 
   def __init__(self):
-    self.client = storage.Client()
+    self.client = get_storage_client()
 
   def get_client(self):
     return self.client

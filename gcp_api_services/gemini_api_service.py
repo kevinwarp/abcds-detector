@@ -33,6 +33,7 @@ from google.genai import types
 from configuration import Configuration
 from prompts.prompt_generator import PromptConfig
 from models import LLMParameters
+from gcp_api_services.gcp_connection import get_project_id, get_genai_client
 
 
 DEFAULT_CONFIG = LLMParameters()
@@ -41,8 +42,8 @@ DEFAULT_CONFIG = LLMParameters()
 class GeminiAPIService:
   """Gemini API Service to leverage the Vertex APIs for inference"""
 
-  def __init__(self, project_id: str):
-    self.project_id = project_id
+  def __init__(self, project_id: str | None = None):
+    self.project_id = project_id or get_project_id()
 
   def execute_gemini_with_genai(
       self, prompt_config: PromptConfig, llm_params: LLMParameters | None = None
@@ -54,11 +55,7 @@ class GeminiAPIService:
     retries = 3
     for this_retry in range(retries):
       try:
-        client = genai.Client(
-            vertexai=True,
-            project=self.project_id,
-            location=llm_params.location,
-        )
+        client = get_genai_client()
         # Build prompt parts
         contents = self._get_modality_params_genai(
             prompt_config.prompt, llm_params
@@ -296,11 +293,10 @@ class GeminiAPIService:
     return []
 
 
-def get_gemini_api_service(config: Configuration) -> GeminiAPIService:
+def get_gemini_api_service(config: Configuration | None = None) -> GeminiAPIService:
   """Gets Vertex AI service to interact with Gemini"""
-  gemini_api_service = GeminiAPIService(config.project_id)
-
-  return gemini_api_service
+  project_id = config.project_id if config else None
+  return GeminiAPIService(project_id)
 
 
 def detect_features_with_llm_in_bulk(

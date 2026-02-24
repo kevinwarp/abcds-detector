@@ -22,6 +22,7 @@
 
 from google.cloud import bigquery
 from google.cloud import exceptions as cloud_exceptions
+from gcp_api_services.gcp_connection import get_bigquery_client
 
 
 class BigQueryAPIService:
@@ -54,7 +55,7 @@ class BigQueryAPIService:
       dataset_name: The name of the dataset to create.
       location: The location where the table will be created
     """
-    client = bigquery.Client()
+    client = get_bigquery_client()
     full_dataset_name = self.__get_full_dataset_name(dataset_name)
     # Construct a full Dataset object to send to the API.
     dataset = bigquery.Dataset(full_dataset_name)
@@ -81,7 +82,7 @@ class BigQueryAPIService:
       table_name: The name of the table to create.
       schema: The schema for the table.
     """
-    client = bigquery.Client(project=self.gcs_project_id)
+    client = get_bigquery_client()
     full_table_name = self.__get_full_table_name(dataset_name, table_name)
     table = bigquery.Table(full_table_name, schema=schema)
     try:
@@ -100,7 +101,7 @@ class BigQueryAPIService:
       dataset_name: The dataset containing the table.
       table_name: The name of the table to delete.
     """
-    client = bigquery.Client()
+    client = get_bigquery_client()
     full_table_name = self.__get_full_table_name(dataset_name, table_name)
     try:
       table = client.get_table(full_table_name)
@@ -115,7 +116,7 @@ class BigQueryAPIService:
       dataset_name: the dataset containing the table
       table_name: The name of the table to delete.
     """
-    client = bigquery.Client()
+    client = get_bigquery_client()
     full_table_name = self.__get_full_table_name(dataset_name, table_name)
     # If the table does not exist, delete_table raises
     # google.api_core.exceptions.NotFound unless not_found_ok is True.
@@ -139,7 +140,7 @@ class BigQueryAPIService:
       table_name: The name of the table to create.
       dataframe: A list of user roles
     """
-    client = bigquery.Client(project=self.gcs_project_id)
+    client = get_bigquery_client()
     full_table_name = self.__get_full_table_name(dataset_name, table_name)
     job_config = bigquery.LoadJobConfig(
         schema=schema, write_disposition=write_disposition

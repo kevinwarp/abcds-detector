@@ -20,6 +20,12 @@ from fastapi import FastAPI, Request, UploadFile, File, Form, Depends
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import storage
+from gcp_api_services.gcp_connection import (
+    get_project_id,
+    get_location,
+    get_storage_client,
+    get_genai_client,
+)
 
 # Load .env file if present (no dependency on python-dotenv)
 _env_path = Path(__file__).parent / ".env"
@@ -200,8 +206,8 @@ async def health_check():
   )
 
 # Config defaults
-PROJECT_ID = "abcds-detector-488021"
-BUCKET_NAME = "abcds-detector-488021-videos"
+PROJECT_ID = get_project_id()
+BUCKET_NAME = os.environ.get("GCP_BUCKET_NAME", f"{PROJECT_ID}-videos")
 KG_API_KEY = os.environ.get("ABCD_KG_API_KEY", "")
 BQ_DATASET = "abcd_detector_ds"
 BQ_TABLE = "abcd_assessments"
@@ -287,7 +293,7 @@ def _save_results_to_gcs(report_id: str, data: dict) -> None:
   """Persist evaluation results as JSON to GCS (fire-and-forget)."""
   def _upload():
     try:
-      client = storage.Client(project=PROJECT_ID)
+      client = get_storage_client()
       bucket = client.bucket(BUCKET_NAME)
       blob = bucket.blob(f"{_REPORTS_GCS_PREFIX}{report_id}.json")
       blob.upload_from_string(
@@ -303,7 +309,7 @@ def _save_results_to_gcs(report_id: str, data: dict) -> None:
 def _load_results_from_gcs(report_id: str) -> Optional[dict]:
   """Load evaluation results from GCS if not in memory."""
   try:
-    client = storage.Client(project=PROJECT_ID)
+    client = get_storage_client()
     bucket = client.bucket(BUCKET_NAME)
     blob = bucket.blob(f"{_REPORTS_GCS_PREFIX}{report_id}.json")
     if not blob.exists():
@@ -362,7 +368,7 @@ def build_config(
 
 def upload_to_gcs(file_path: str, destination_name: str) -> str:
   """Upload a local file to GCS and return the gs:// URI."""
-  client = storage.Client(project=PROJECT_ID)
+  client = get_storage_client()
   bucket = client.bucket(BUCKET_NAME)
   blob = bucket.blob(destination_name)
   blob.upload_from_filename(file_path)
@@ -1465,7 +1471,7 @@ async def serve_video(report_id: str):
   bucket_name = parts[0]
   blob_name = parts[1] if len(parts) > 1 else ""
 
-  client = storage.Client(project=PROJECT_ID)
+  client = get_storage_client()
   bucket = client.bucket(bucket_name)
   blob = bucket.blob(blob_name)
 
@@ -2025,8 +2031,7 @@ async def _prewarm():
 
   def _warm():
     try:
-      from google import genai
-      client = genai.Client(vertexai=True, project=PROJECT_ID, location="us-central1")
+      client = get_genai_client()
       # Tiny request to establish connection pool
       client.models.generate_content(
           model=FLASH_MODEL,
