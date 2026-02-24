@@ -4,6 +4,7 @@
 
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -208,6 +209,9 @@ BQ_TABLE = "abcd_assessments"
 
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+
+# Render time estimator: estimated_render_seconds = ceil(video_duration × RENDER_FACTOR)
+RENDER_FACTOR = float(os.environ.get("RENDER_FACTOR", "23.0"))
 
 
 def _send_slack_notification(results: dict, report_url: str) -> None:
@@ -1198,12 +1202,18 @@ async def evaluate_video(
       provider_type=provider_type,
   )
 
+  # Compute render estimate — use MAX_VIDEO_SECONDS as fallback since we
+  # don't know the exact duration yet in the SSE path (URL mode).
+  _est_duration = float(credits_mod.MAX_VIDEO_SECONDS)  # will be refined post-eval
+  _est_render_secs = math.ceil(_est_duration * RENDER_FACTOR)
+  render_started_at = datetime.datetime.utcnow()
+
   # Persist render row (tokens_used filled in after success)
   render_row = Render(
       render_id=report_id,
       status="rendering",
       progress_pct=0,
-      started_at=datetime.datetime.utcnow(),
+      started_at=render_started_at,
       user_id=user_id,
       user_email=user_email,
       source_type=source_type,
@@ -1214,6 +1224,8 @@ async def evaluate_video(
       model=PRO_MODEL,
       tokens_estimated=credits_mod.MAX_TOKENS_PER_VIDEO,
       tokens_used=0,
+      render_factor=RENDER_FACTOR,
+      estimated_render_seconds=_est_render_secs,
   )
   db.add(render_row)
   db.commit()
@@ -1229,13 +1241,17 @@ async def evaluate_video(
   def _run():
     return run_evaluation(gcs_uri, config, on_progress=on_progress)
 
-  EVALUATION_TIMEOUT_SECONDS = 300  # 5 minutes
+  # Dynamic timeout: 1.5× the estimate, minimum 300s
+  EVALUATION_TIMEOUT_SECONDS = max(300, int(_est_render_secs * 1.5))
 
   async def event_stream():
     loop = asyncio.get_event_loop()
     task = loop.run_in_executor(None, _run)
     results = None
     start_time = asyncio.get_event_loop().time()
+
+    # Send render estimate event so the client can start a countdown
+    yield f"data: {json.dumps({'step': 'render_estimate', 'estimated_render_seconds': _est_render_secs, 'render_started_at': render_started_at.isoformat() + 'Z', 'render_factor': RENDER_FACTOR})}\n\n"
 
     try:
       while True:
@@ -1620,6 +1636,9 @@ async def evaluate_file(
       # Credits are deducted AFTER render success using actual duration.
       report_id = str(uuid.uuid4())[:8]
 
+      # Compute render estimate from known duration
+      _file_est_render_secs = math.ceil(duration * RENDER_FACTOR)
+
       # Persist render row (tokens_used filled in after success)
       render_row = Render(
           render_id=report_id,
@@ -1637,6 +1656,8 @@ async def evaluate_file(
           model=PRO_MODEL,
           tokens_estimated=credits_mod.required_tokens(duration),
           tokens_used=0,
+          render_factor=RENDER_FACTOR,
+          estimated_render_seconds=_file_est_render_secs,
       )
       db.add(render_row)
       db.commit()
@@ -1963,40 +1984,69 @@ async def serve_comparison_report(comparison_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Render status endpoint — supports countdown resume after page refresh
+# ---------------------------------------------------------------------------
+@app.get("/api/render/{render_id}/status")
+async def get_render_status(
+    render_id: str,
+    db: Session = Depends(get_db),
+):
+  """Return render status + estimate fields for countdown resilience."""
+  r = db.query(Render).filter(Render.render_id == render_id).first()
+  if not r:
+    return JSONResponse({"error": "Render not found"}, status_code=404)
+  return JSONResponse({
+      "render_id": r.render_id,
+      "status": r.status,
+      "estimated_render_seconds": r.estimated_render_seconds,
+      "render_started_at": r.started_at.isoformat() + "Z" if r.started_at else None,
+      "render_factor": r.render_factor,
+      "progress_pct": r.progress_pct,
+  })
+
+
+# ---------------------------------------------------------------------------
 # Stale render reaper — marks renders stuck in non-terminal states
 # ---------------------------------------------------------------------------
-STALE_RENDER_THRESHOLD_SECONDS = 600  # 10 minutes
+STALE_RENDER_THRESHOLD_SECONDS = 3000  # 50 minutes (covers 60s video × 23 + margin)
 
 
 async def _reap_stale_renders():
-  """Periodically mark renders stuck in 'queued'/'rendering' as failed."""
+  """Periodically mark renders stuck in 'queued'/'rendering' as failed.
+
+  Uses the per-render estimated_render_seconds (× 2) when available,
+  otherwise falls back to the global STALE_RENDER_THRESHOLD_SECONDS.
+  """
   while True:
     await asyncio.sleep(120)  # check every 2 minutes
     try:
-      cutoff = datetime.datetime.utcnow() - datetime.timedelta(
-          seconds=STALE_RENDER_THRESHOLD_SECONDS,
-      )
+      now = datetime.datetime.utcnow()
       db = next(get_db())
-      stale = (
+      active = (
           db.query(Render)
           .filter(
               Render.status.in_(["queued", "rendering"]),
-              Render.started_at < cutoff,
           )
           .all()
       )
-      for r in stale:
-        r.status = "failed"
-        r.finished_at = datetime.datetime.utcnow()
-        r.error_code = "STALE_TIMEOUT"
-        r.error_message = (
-            f"Render was stuck in '{r.status}' for over "
-            f"{STALE_RENDER_THRESHOLD_SECONDS}s and was automatically failed"
-        )
-        logging.warning("Reaped stale render %s (started %s)", r.render_id, r.started_at)
-      if stale:
+      reaped = 0
+      for r in active:
+        threshold = STALE_RENDER_THRESHOLD_SECONDS
+        if r.estimated_render_seconds:
+          threshold = max(threshold, r.estimated_render_seconds * 2)
+        if r.started_at and (now - r.started_at).total_seconds() > threshold:
+          r.status = "failed"
+          r.finished_at = now
+          r.error_code = "STALE_TIMEOUT"
+          r.error_message = (
+              f"Render was stuck in '{r.status}' for over "
+              f"{threshold}s and was automatically failed"
+          )
+          logging.warning("Reaped stale render %s (started %s)", r.render_id, r.started_at)
+          reaped += 1
+      if reaped:
         db.commit()
-        logging.info("Reaped %d stale render(s)", len(stale))
+        logging.info("Reaped %d stale render(s)", reaped)
       db.close()
     except Exception as ex:
       logging.error("Stale render reaper error: %s", ex)

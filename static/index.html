@@ -924,6 +924,7 @@ function clearInput() {
 
 const MAX_FILE_SIZE_MB = 32;
 const MAX_VIDEO_SECONDS = 60;
+const RENDER_FACTOR = 23;
 const ALLOWED_EXTENSIONS = ['.mp4'];
 const ALLOWED_MIME_TYPES = ['video/mp4'];
 
@@ -973,10 +974,59 @@ function handleFile(file) {
         clearInput();
         return;
       }
-      $('fileSize').textContent = `${sizeMB} MB \u00b7 ${dur}s \u00b7 ~${cost} tokens`;
+      const estRender = Math.ceil(dur * RENDER_FACTOR);
+      const estMin = Math.floor(estRender / 60);
+      const estSec = estRender % 60;
+      const estLabel = estMin > 0 ? `${estMin}m ${estSec}s` : `${estSec}s`;
+      $('fileSize').textContent = `${sizeMB} MB \u00b7 ${dur}s \u00b7 ~${cost} tokens \u00b7 Est. render: ${estLabel}`;
     };
     video.src = URL.createObjectURL(file);
   }
+}
+
+// ---------- Countdown Timer ----------
+let _countdownInterval = null;
+let _countdownEstSecs = 0;
+let _countdownStartedAt = null;
+
+function _fmtTime(totalSecs) {
+  const s = Math.max(0, Math.ceil(totalSecs));
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return m > 0 ? `${m}m ${String(sec).padStart(2, '0')}s` : `${sec}s`;
+}
+
+function _startCountdown(estimatedSecs, startedAtISO) {
+  _stopCountdown();
+  _countdownEstSecs = estimatedSecs;
+  _countdownStartedAt = new Date(startedAtISO);
+  _tickCountdown();
+  _countdownInterval = setInterval(_tickCountdown, 1000);
+}
+
+function _tickCountdown() {
+  if (!_countdownStartedAt) return;
+  const elapsed = (Date.now() - _countdownStartedAt.getTime()) / 1000;
+  const remaining = _countdownEstSecs - elapsed;
+  const el = $('status');
+  if (remaining > 0) {
+    const pct = Math.min(99, Math.round((elapsed / _countdownEstSecs) * 100));
+    el.className = 'status info';
+    el.innerHTML = `
+      <div><span class="spinner"></span> <span class="step-label">Rendering\u2026 ${_fmtTime(remaining)} remaining</span></div>
+      <div class="step-detail">Estimated total: ${_fmtTime(_countdownEstSecs)}</div>
+      <div class="progress-wrap"><div class="progress-bar" style="width:${pct}%"></div></div>`;
+  } else {
+    el.className = 'status info';
+    el.innerHTML = `
+      <div><span class="spinner"></span> <span class="step-label">Finalizing render\u2026</span></div>
+      <div class="step-detail">Taking longer than expected \u2014 please wait</div>
+      <div class="progress-wrap"><div class="progress-bar" style="width:99%"></div></div>`;
+  }
+}
+
+function _stopCountdown() {
+  if (_countdownInterval) { clearInterval(_countdownInterval); _countdownInterval = null; }
 }
 
 // Evaluate
@@ -1037,11 +1087,20 @@ $('btnEvaluate').addEventListener('click', async () => {
         try {
           const msg = JSON.parse(line.slice(6));
           if (msg.step === 'complete') {
+            _stopCountdown();
             finalData = msg.data;
           } else if (msg.step === 'error') {
+            _stopCountdown();
             throw new Error(msg.message);
+          } else if (msg.step === 'render_estimate') {
+            // Start countdown timer from server estimate
+            _startCountdown(msg.estimated_render_seconds, msg.render_started_at);
           } else {
-            setProgress('info', msg.message, `Step: ${msg.step}`, msg.pct || 0);
+            // Only update progress text if countdown is NOT running
+            // (countdown handles its own UI updates)
+            if (!_countdownInterval) {
+              setProgress('info', msg.message, `Step: ${msg.step}`, msg.pct || 0);
+            }
             if (msg.partial) renderPartial(msg.partial);
           }
         } catch (e) {
@@ -1050,6 +1109,7 @@ $('btnEvaluate').addEventListener('click', async () => {
       }
     }
 
+    _stopCountdown();
     if (!finalData) throw new Error('Evaluation did not return results');
     setStatus('success', `\u2705 Evaluation complete for <strong>${finalData.brand_name || finalData.video_name}</strong>`);
     renderResults(finalData);
@@ -1061,6 +1121,7 @@ $('btnEvaluate').addEventListener('click', async () => {
       updateCreditsDisplay();
     }
   } catch (err) {
+    _stopCountdown();
     const msg = err.message || 'Unknown error';
     setStatus('error', '\u274c Error: ' + msg);
   } finally {

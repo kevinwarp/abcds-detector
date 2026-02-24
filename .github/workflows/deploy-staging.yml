@@ -1,0 +1,135 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PROJECT_ID: abcds-detector-488021
+  REGION: us-central1
+  SERVICE_NAME: creative-reviewer-staging
+  REPOSITORY: creative-reviewer
+  IMAGE: us-central1-docker.pkg.dev/abcds-detector-488021/creative-reviewer/app
+
+jobs:
+  # -----------------------------------------------------------------------
+  # CI gate — lint, test, build validation
+  # -----------------------------------------------------------------------
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # -----------------------------------------------------------------------
+  # Deploy to staging Cloud Run service
+  # -----------------------------------------------------------------------
+  deploy-staging:
+    needs: [ci]
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      staging_url: ${{ steps.staging-url.outputs.url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      # Docker build with GHA cache for fast rebuilds
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:staging-${{ github.sha }}
+            ${{ env.IMAGE }}:staging-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to Cloud Run (Staging)
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image "${{ env.IMAGE }}:staging-${{ github.sha }}" \
+            --region ${{ env.REGION }} \
+            --platform managed \
+            --cpu 1 \
+            --memory 1Gi \
+            --concurrency 2 \
+            --min-instances 0 \
+            --max-instances 2 \
+            --timeout 1500 \
+            --set-env-vars "\
+              ENVIRONMENT=staging,\
+              PUBLIC_BASE_URL=${{ secrets.STAGING_PUBLIC_BASE_URL }}" \
+            --set-secrets "\
+              SESSION_SECRET=STAGING_SESSION_SECRET:latest,\
+              GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID:latest,\
+              GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,\
+              STRIPE_SECRET_KEY=STAGING_STRIPE_SECRET_KEY:latest,\
+              STRIPE_WEBHOOK_SECRET=STAGING_STRIPE_WEBHOOK_SECRET:latest,\
+              STRIPE_PRICE_1000=STRIPE_PRICE_1000:latest,\
+              STRIPE_PRICE_3000=STRIPE_PRICE_3000:latest,\
+              DATABASE_URL=STAGING_DATABASE_URL:latest,\
+              ABCD_KG_API_KEY=ABCD_KG_API_KEY:latest,\
+              SLACK_WEBHOOK_URL=STAGING_SLACK_WEBHOOK_URL:latest" \
+            --allow-unauthenticated \
+            --quiet
+
+      - name: Get staging URL
+        id: staging-url
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region ${{ env.REGION }} \
+            --format 'value(status.url)')
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Staging URL: $URL"
+
+      - name: Smoke test staging
+        run: |
+          URL="${{ steps.staging-url.outputs.url }}"
+          echo "Running smoke tests against $URL"
+
+          # Wait for service to become ready (new revision rollout)
+          sleep 10
+
+          # Health check with retries
+          for i in 1 2 3; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" --max-time 15) && break
+            echo "Attempt $i failed, retrying in 5s..."
+            sleep 5
+          done
+
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Health check failed with status $STATUS"
+            exit 1
+          fi
+
+          # Verify response body
+          HEALTH=$(curl -s "$URL/health" --max-time 15)
+          echo "Health response: $HEALTH"
+          echo "$HEALTH" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assert d['status'] in ('healthy', 'degraded'), f'Bad status: {d}'
+          assert d.get('database') == 'ok', f'DB unhealthy: {d}'
+          print('Smoke tests passed')
+          "

@@ -44,7 +44,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --concurrency 4 \
   --min-instances 1 \
   --max-instances 10 \
-  --timeout 300 \
+  --timeout 1500 \
   --set-env-vars "\
 ENVIRONMENT=production,\
 PUBLIC_BASE_URL=https://app.aicreativereview.com,\
