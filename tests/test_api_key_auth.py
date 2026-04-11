@@ -7,6 +7,21 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Clear slowapi's in-memory counters before each test to prevent
+    cross-test rate-limit bleed (the /api/evaluate_file endpoint is
+    capped at 5/minute, which is easily exceeded across a test suite)."""
+    from web_app import limiter
+    storage = getattr(limiter, "_storage", None)
+    if storage is not None:
+        try:
+            storage.reset()
+        except Exception:
+            pass
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Minimal fake evaluation result (same shape as web_app.format_results)
 # ---------------------------------------------------------------------------
@@ -385,3 +400,169 @@ class TestEvaluateFileWithApiKey:
             headers={"X-API-Key": raw_key},
         )
         assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# /api/evaluate_file — input validation (file vs url)
+# ---------------------------------------------------------------------------
+
+class TestEvaluateFileInputValidation:
+    """Verify the new file/url mutual-exclusion rules."""
+
+    @staticmethod
+    def _fake_mp4():
+        return io.BytesIO(b"\x00\x00\x00\x18ftypmp42")
+
+    @patch("web_app.credits_mod.release_job_slot")
+    @patch("web_app.credits_mod.acquire_job_slot", return_value=True)
+    def test_neither_file_nor_url_returns_400(
+        self, mock_acquire, mock_release, client
+    ):
+        raw_key = _register_and_get_key(client, "noinput@example.com")
+        client.cookies.clear()
+        resp = client.post(
+            "/api/evaluate_file",
+            data={"use_abcd": "true"},
+            headers={"X-API-Key": raw_key},
+        )
+        assert resp.status_code == 400
+        assert "missing_input" in resp.json()["error"]
+
+    @patch("web_app.credits_mod.release_job_slot")
+    @patch("web_app.credits_mod.acquire_job_slot", return_value=True)
+    def test_both_file_and_url_returns_400(
+        self, mock_acquire, mock_release, client
+    ):
+        raw_key = _register_and_get_key(client, "bothinput@example.com")
+        client.cookies.clear()
+        resp = client.post(
+            "/api/evaluate_file",
+            files={"file": ("video.mp4", self._fake_mp4(), "video/mp4")},
+            data={"url": "https://www.youtube.com/watch?v=abc", "use_abcd": "true"},
+            headers={"X-API-Key": raw_key},
+        )
+        assert resp.status_code == 400
+        assert "ambiguous_input" in resp.json()["error"]
+
+
+# ---------------------------------------------------------------------------
+# /api/evaluate_file — YouTube URL mode
+# ---------------------------------------------------------------------------
+
+class TestEvaluateYouTubeUrl:
+    """Verify that /api/evaluate_file accepts a YouTube URL and returns the
+    full review JSON, with the same auth rules as the file upload path."""
+
+    YOUTUBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    YOUTU_BE_URL = "https://youtu.be/dQw4w9WgXcQ"
+
+    @patch("web_app.notification_service.notify_evaluation_started", return_value=False)
+    @patch("web_app._send_slack_notification")
+    @patch("web_app._save_results_to_gcs")
+    @patch("web_app.run_evaluation", return_value=_FAKE_RESULT.copy())
+    @patch("web_app.credits_mod.deduct_credits", return_value=50)
+    @patch("web_app.credits_mod.release_job_slot")
+    @patch("web_app.credits_mod.acquire_job_slot", return_value=True)
+    def test_youtube_url_returns_full_review(
+        self,
+        mock_acquire, mock_release, mock_deduct, mock_run,
+        mock_save, mock_slack, mock_notify,
+        client,
+    ):
+        raw_key = _register_and_get_key(client, "ytuser@example.com")
+        client.cookies.clear()
+
+        resp = client.post(
+            "/api/evaluate_file",
+            data={"url": self.YOUTUBE_URL, "use_abcd": "true", "use_ci": "true"},
+            headers={"X-API-Key": raw_key},
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "report_id" in body
+        assert "abcd" in body
+        assert body["brand_name"] == "TestBrand"
+        # run_evaluation must have been called with the YouTube URL
+        call_args = mock_run.call_args
+        assert self.YOUTUBE_URL in call_args[0]
+        mock_deduct.assert_called_once()
+
+    @patch("web_app.notification_service.notify_evaluation_started", return_value=False)
+    @patch("web_app._send_slack_notification")
+    @patch("web_app._save_results_to_gcs")
+    @patch("web_app.run_evaluation", return_value=_FAKE_RESULT.copy())
+    @patch("web_app.credits_mod.deduct_credits", return_value=50)
+    @patch("web_app.credits_mod.release_job_slot")
+    @patch("web_app.credits_mod.acquire_job_slot", return_value=True)
+    def test_youtu_be_short_url_accepted(
+        self,
+        mock_acquire, mock_release, mock_deduct, mock_run,
+        mock_save, mock_slack, mock_notify,
+        client,
+    ):
+        raw_key = _register_and_get_key(client, "ytshort@example.com")
+        client.cookies.clear()
+
+        resp = client.post(
+            "/api/evaluate_file",
+            data={"url": self.YOUTU_BE_URL, "use_abcd": "true"},
+            headers={"X-API-Key": raw_key},
+        )
+        assert resp.status_code == 200, resp.text
+
+    @patch("web_app.credits_mod.release_job_slot")
+    @patch("web_app.credits_mod.acquire_job_slot", return_value=True)
+    def test_non_youtube_url_rejected_with_415(
+        self, mock_acquire, mock_release, client
+    ):
+        raw_key = _register_and_get_key(client, "vimeouser@example.com")
+        client.cookies.clear()
+
+        resp = client.post(
+            "/api/evaluate_file",
+            data={"url": "https://vimeo.com/123456789", "use_abcd": "true"},
+            headers={"X-API-Key": raw_key},
+        )
+        assert resp.status_code == 415
+        assert "YouTube" in resp.json()["message"]
+
+    @patch("web_app.credits_mod.release_job_slot")
+    @patch("web_app.credits_mod.acquire_job_slot", return_value=True)
+    def test_unauthenticated_url_request_rejected(
+        self, mock_acquire, mock_release, client
+    ):
+        client.cookies.clear()
+        resp = client.post(
+            "/api/evaluate_file",
+            data={"url": self.YOUTUBE_URL, "use_abcd": "true"},
+        )
+        assert resp.status_code == 401
+
+    @patch("web_app.credits_mod.release_job_slot")
+    @patch("web_app.credits_mod.acquire_job_slot", return_value=True)
+    def test_url_mode_uses_youtube_provider(
+        self, mock_acquire, mock_release, client
+    ):
+        """run_evaluation must be called with provider_type=YOUTUBE config."""
+        _register_and_get_key(client, "ytprovider@example.com")
+
+        captured = {}
+
+        def _capture_config(video_uri, config, on_progress):
+            captured["provider"] = config.creative_provider_type
+            return _FAKE_RESULT.copy()
+
+        with patch("web_app.run_evaluation", side_effect=_capture_config), \
+             patch("web_app.credits_mod.deduct_credits", return_value=50), \
+             patch("web_app._save_results_to_gcs"), \
+             patch("web_app._send_slack_notification"):
+
+            resp = client.post(
+                "/api/evaluate_file",
+                data={"url": self.YOUTUBE_URL},
+            )
+
+        assert resp.status_code == 200
+        import models
+        assert captured["provider"] == models.CreativeProviderType.YOUTUBE

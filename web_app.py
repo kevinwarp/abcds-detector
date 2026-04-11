@@ -1551,25 +1551,44 @@ async def get_calibration_data(
 @limiter.limit("5/minute")
 async def evaluate_file(
     request: Request,
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
+    url: Optional[str] = Form(None),
     use_abcd: bool = Form(True),
     use_shorts: bool = Form(False),
     use_ci: bool = Form(True),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-  """Upload a video file and return the complete evaluation report as JSON.
+  """Upload an MP4 file OR provide a YouTube URL and receive the full review as JSON.
+
+  Accepts (exactly one required):
+  - file   multipart MP4 upload (max 32 MB, max 60 s)
+  - url    public YouTube URL (youtube.com or youtu.be)
 
   Enforces:
-  - 50MB file size limit
-  - 60s video duration limit
+  - File: 32 MB size limit, 60 s duration limit
   - Credit balance check (minimum tokens required)
-  - 1 concurrent upload per user
+  - 1 concurrent job per user
 
   Credits are deducted AFTER a successful render, based on the
   actual video duration in seconds (10 tokens/sec).  Failed
   evaluations are not charged.
   """
+  # Input mode — exactly one of file or url must be present
+  _has_file = file is not None
+  _has_url = bool(url and url.strip())
+  if not _has_file and not _has_url:
+    return JSONResponse(
+        {"error": "missing_input",
+         "message": "Provide either a 'file' (MP4 upload) or a 'url' (YouTube URL)."},
+        status_code=400,
+    )
+  if _has_file and _has_url:
+    return JSONResponse(
+        {"error": "ambiguous_input",
+         "message": "Provide either a 'file' or a 'url', not both."},
+        status_code=400,
+    )
   try:
     # Concurrent upload limit
     if not credits_mod.acquire_job_slot(current_user.id):
@@ -1579,6 +1598,108 @@ async def evaluate_file(
       )
 
     try:
+      # ================================================================
+      # URL mode — YouTube link provided instead of a file upload
+      # ================================================================
+      if _has_url:
+        clean_url = url.strip()
+        if "youtube.com" not in clean_url and "youtu.be" not in clean_url:
+          return JSONResponse(
+              {"error": "unsupported_url",
+               "message": "Only YouTube URLs are supported (youtube.com or youtu.be)."},
+              status_code=415,
+          )
+
+        # Credit balance check
+        if current_user.credits_balance < credits_mod.MIN_TOKENS_TO_RENDER:
+          return JSONResponse(
+              {"error": "insufficient_credits",
+               "message": f"Need at least {credits_mod.MIN_TOKENS_TO_RENDER} credits but only have {current_user.credits_balance}",
+               "credits_balance": current_user.credits_balance,
+               "required": credits_mod.MIN_TOKENS_TO_RENDER,
+               "offers": [
+                   {"pack": k, "usd": v["usd"], "tokens": v["tokens"]}
+                   for k, v in credits_mod.TOKEN_PACKS.items()
+               ]},
+              status_code=402,
+          )
+
+        report_id = str(uuid.uuid4())[:8]
+        _url_est_render_secs = math.ceil(float(credits_mod.MAX_VIDEO_SECONDS) * RENDER_FACTOR)
+
+        render_row = Render(
+            render_id=report_id,
+            status="rendering",
+            progress_pct=0,
+            started_at=datetime.datetime.utcnow(),
+            user_id=current_user.id,
+            user_email=current_user.email,
+            source_type="url",
+            source_ref=clean_url,
+            prompt_text=clean_url,
+            config_json=json.dumps({"use_abcd": use_abcd, "use_shorts": use_shorts, "use_ci": use_ci}),
+            pipeline_version="Gemini → FFmpeg → Encode v3",
+            model=PRO_MODEL,
+            tokens_estimated=credits_mod.MAX_TOKENS_PER_VIDEO,
+            tokens_used=0,
+            render_factor=RENDER_FACTOR,
+            estimated_render_seconds=_url_est_render_secs,
+        )
+        db.add(render_row)
+        db.commit()
+
+        logging.info("Starting URL evaluation for %s", clean_url)
+        config = build_config(
+            use_abcd=use_abcd,
+            use_shorts=use_shorts,
+            use_ci=use_ci,
+            provider_type="YOUTUBE",
+        )
+
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, run_evaluation, clean_url, config, None)
+
+        actual_dur = credits_mod.get_actual_duration(results) or float(credits_mod.MAX_VIDEO_SECONDS)
+        tokens_used = credits_mod.deduct_credits(db, current_user, actual_dur, job_id=report_id)
+
+        results["report_id"] = report_id
+        results["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+        results["tokens_used"] = tokens_used
+        results["credits_remaining"] = current_user.credits_balance
+        results["duration_seconds"] = actual_dur
+        results["user_email"] = current_user.email
+
+        results_store[report_id] = results
+        _save_results_to_gcs(report_id, results)
+
+        base_url = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+        report_url = f"{base_url}/report/{report_id}"
+        results["report_url"] = report_url
+
+        try:
+          render_row.status = "succeeded"
+          render_row.progress_pct = 100
+          render_row.finished_at = datetime.datetime.utcnow()
+          render_row.output_url = report_url
+          render_row.duration_seconds = actual_dur
+          render_row.tokens_used = tokens_used
+          db.commit()
+        except Exception as _ex:
+          logging.error("URL render row update failed: %s", _ex)
+
+        _send_slack_notification(results, report_url)
+        try:
+          render_row.slack_notified = bool(SLACK_WEBHOOK_URL)
+          db.commit()
+        except Exception as _ex:
+          logging.error("URL Slack status update failed: %s", _ex)
+
+        logging.info("URL evaluation complete. Report ID: %s", report_id)
+        return JSONResponse(results)
+
+      # ================================================================
+      # File mode — MP4 upload
+      # ================================================================
       # Step 0: File type check
       _fname = (file.filename or "").lower()
       _ext = Path(_fname).suffix
