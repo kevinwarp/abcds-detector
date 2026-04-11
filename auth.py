@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import datetime
+import hashlib
 import logging
 import os
 import re
@@ -23,7 +24,7 @@ from sqlalchemy.orm import Session
 
 import email_service
 import notification_service
-from db import CreditTransaction, User, get_db
+from db import ApiKey, CreditTransaction, User, get_db
 from credits import token_model_info
 
 # Lazy import to avoid circular dependency at module level
@@ -204,14 +205,43 @@ def _decode_session_token(token: str) -> Optional[dict]:
     return None
 
 
+def _hash_api_key(raw_key: str) -> str:
+  """Return the SHA-256 hex digest of a raw API key string."""
+  return hashlib.sha256(raw_key.encode()).hexdigest()
+
+
 def get_current_user(
     request: Request,
     db: Session = Depends(get_db),
 ) -> User:
-  """FastAPI dependency: extract and validate the session cookie.
+  """FastAPI dependency: authenticate via session cookie OR X-API-Key header.
 
+  API key takes precedence when present. Falls back to cookie auth.
   Returns the User object or raises 401.
   """
+  # --- API key path ---
+  raw_key = request.headers.get("X-API-Key", "").strip()
+  if raw_key:
+    key_hash = _hash_api_key(raw_key)
+    api_key = (
+        db.query(ApiKey)
+        .filter(ApiKey.key_hash == key_hash, ApiKey.is_active == True)  # noqa: E712
+        .first()
+    )
+    if not api_key:
+      raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+    # Update last_used_at (best-effort, non-blocking)
+    try:
+      api_key.last_used_at = datetime.datetime.utcnow()
+      db.commit()
+    except Exception:
+      db.rollback()
+    user = db.query(User).filter(User.id == api_key.user_id).first()
+    if not user:
+      raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+  # --- Session cookie path ---
   token = request.cookies.get(SESSION_COOKIE)
   if not token:
     raise HTTPException(status_code=401, detail="Not authenticated")
@@ -654,6 +684,126 @@ async def reset_password(request: Request, db: Session = Depends(get_db)):
 
   logging.info("Password reset completed for: %s", user.email)
   return JSONResponse({"status": "ok", "message": "Password has been reset. You can now sign in."})
+
+
+# ---------------------------------------------------------------------------
+# API Key management endpoints
+# ---------------------------------------------------------------------------
+
+_API_KEY_PREFIX = "acr_"
+_MAX_KEYS_PER_USER = 10
+
+
+@router.post("/api-keys", status_code=201)
+async def create_api_key(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+  """Create a new API key for the current user.
+
+  Returns the raw key **once** — it cannot be retrieved again.
+  Store it somewhere safe (e.g. an environment variable).
+  """
+  _require_json(request)
+
+  body = await request.json()
+  name = (body.get("name") or "").strip()
+  if not name:
+    raise HTTPException(status_code=400, detail="'name' is required")
+  if len(name) > 64:
+    raise HTTPException(status_code=400, detail="'name' must be 64 characters or fewer")
+
+  # Enforce per-user key limit
+  active_count = (
+      db.query(ApiKey)
+      .filter(ApiKey.user_id == current_user.id, ApiKey.is_active == True)  # noqa: E712
+      .count()
+  )
+  if active_count >= _MAX_KEYS_PER_USER:
+    raise HTTPException(
+        status_code=400,
+        detail=f"Maximum of {_MAX_KEYS_PER_USER} active API keys reached. Revoke one first.",
+    )
+
+  # Generate key: acr_ + 40 random hex chars (160 bits entropy)
+  raw_secret = _API_KEY_PREFIX + secrets.token_hex(20)
+  # Display prefix = scheme prefix + first 8 hex chars
+  display_prefix = raw_secret[:len(_API_KEY_PREFIX) + 8]
+
+  api_key = ApiKey(
+      user_id=current_user.id,
+      name=name,
+      key_prefix=display_prefix,
+      key_hash=_hash_api_key(raw_secret),
+  )
+  db.add(api_key)
+  db.commit()
+  db.refresh(api_key)
+
+  logging.info("API key created for user %s (key_id=%s)", current_user.email, api_key.id)
+
+  return JSONResponse(
+      {
+          "id": api_key.id,
+          "name": api_key.name,
+          "key": raw_secret,   # shown once only
+          "key_prefix": api_key.key_prefix,
+          "created_at": api_key.created_at.isoformat(),
+          "warning": "Save this key — it will not be shown again.",
+      },
+      status_code=201,
+  )
+
+
+@router.get("/api-keys")
+async def list_api_keys(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+  """List all API keys for the current user (secrets are never returned)."""
+  keys = (
+      db.query(ApiKey)
+      .filter(ApiKey.user_id == current_user.id)
+      .order_by(ApiKey.created_at.desc())
+      .all()
+  )
+  return JSONResponse({
+      "api_keys": [
+          {
+              "id": k.id,
+              "name": k.name,
+              "key_prefix": k.key_prefix,
+              "is_active": k.is_active,
+              "created_at": k.created_at.isoformat() if k.created_at else None,
+              "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
+          }
+          for k in keys
+      ]
+  })
+
+
+@router.delete("/api-keys/{key_id}", status_code=200)
+async def revoke_api_key(
+    key_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+  """Revoke (soft-delete) an API key owned by the current user."""
+  api_key = (
+      db.query(ApiKey)
+      .filter(ApiKey.id == key_id, ApiKey.user_id == current_user.id)
+      .first()
+  )
+  if not api_key:
+    raise HTTPException(status_code=404, detail="API key not found")
+  if not api_key.is_active:
+    return JSONResponse({"status": "already_revoked"})
+
+  api_key.is_active = False
+  db.commit()
+  logging.info("API key revoked for user %s (key_id=%s)", current_user.email, key_id)
+  return JSONResponse({"status": "revoked", "id": key_id})
 
 
 @router.get("/transactions")
