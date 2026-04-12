@@ -60,8 +60,13 @@ Does the ad tell the viewer what to do? A clear call to action — spoken and on
 
 ## How It Works, Step by Step
 
-### 1. Upload your video
-Drag and drop an MP4 (up to 60 seconds, 32 MB) onto the platform, or submit it via API. No configuration needed.
+### 1. Provide your video
+There are two ways to submit an ad for review — pick whichever fits your workflow:
+
+- **Upload an MP4** — Drag and drop a file (up to 60 seconds, 32 MB) onto the platform or send it via API.
+- **Paste a YouTube URL** — Drop a public `youtube.com` or `youtu.be` link into the URL field. No download or file handling needed.
+
+No other configuration is required.
 
 ### 2. The AI reads the ad
 Google's Gemini AI watches the video and simultaneously:
@@ -137,11 +142,18 @@ Visit [app.aicreativereview.com](https://app.aicreativereview.com), sign in with
 ### API (for automation or integrations)
 Generate an API key from your account settings, then submit videos programmatically and receive the full report as structured data. Useful for connecting to internal dashboards, triggering reviews on upload, or batch processing an entire creative library.
 
+The same endpoint accepts either an MP4 file or a YouTube URL — both return the identical JSON response:
+
 ```
-# Submit a video, get the full review back
+# Option A — MP4 file upload
 POST https://app.aicreativereview.com/api/evaluate_file
 Header: X-API-Key: acr_yourkey
-Body:   file=video.mp4, use_abcd=true, use_ci=true
+Body:   file=ad.mp4, use_abcd=true, use_ci=true
+
+# Option B — YouTube URL
+POST https://app.aicreativereview.com/api/evaluate_file
+Header: X-API-Key: acr_yourkey
+Body:   url=https://www.youtube.com/watch?v=..., use_abcd=true, use_ci=true
 ```
 
 Full API documentation is in [API.md](API.md).
@@ -153,7 +165,7 @@ Full API documentation is in [API.md](API.md).
 The AI is accurate **90–95% of the time** against human expert reviewers. A few things to keep in mind:
 
 - **It's a screening tool, not a final judgment.** It can occasionally miss something a human would catch, or flag something that isn't there. Use it to identify what needs a closer look, not as the last word.
-- **YouTube URLs are supported** but receive a slightly lighter analysis than uploaded MP4 files.
+- **YouTube URLs and MP4 uploads are both fully supported.** YouTube-sourced reviews run the same AI analysis; the only difference is that a small number of annotation-based checks (which require a locally hosted file) are skipped. All ABCD scoring, persuasion detection, and performance predictions are included.
 - **Videos must be 60 seconds or under.** Longer cuts should be trimmed to the ad version before submission.
 - **Processing time:** ~2 minutes for a 30-second ad, ~5 minutes for a 60-second ad.
 
