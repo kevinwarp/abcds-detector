@@ -42,7 +42,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --cpu 4 \
   --memory 4Gi \
   --concurrency 4 \
-  --min-instances 1 \
+  --min-instances 0 \
   --max-instances 10 \
   --timeout 1500 \
   --set-env-vars "\

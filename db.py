@@ -93,6 +93,9 @@ class User(Base):
   renders = relationship(
       "Render", back_populates="user", lazy="dynamic",
   )
+  api_keys = relationship(
+      "ApiKey", back_populates="user", lazy="dynamic",
+  )
 
 
 class CreditTransaction(Base):
@@ -159,6 +162,26 @@ class Render(Base):
   slack_notified = Column(Boolean, default=False, nullable=False)
 
   user = relationship("User", back_populates="renders")
+
+
+class ApiKey(Base):
+  """First-party API keys for programmatic access.
+
+  The raw secret is never stored — only a SHA-256 hex digest and a short
+  prefix (first 8 chars after the 'acr_' scheme prefix) for display.
+  """
+  __tablename__ = "api_keys"
+
+  id = Column(String, primary_key=True, default=_uuid)
+  user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+  name = Column(String, nullable=False)           # user-given label
+  key_prefix = Column(String, nullable=False)     # e.g. "acr_a1b2c3d4"
+  key_hash = Column(String, nullable=False, unique=True)  # SHA-256 hex
+  is_active = Column(Boolean, default=True, nullable=False)
+  created_at = Column(DateTime, default=datetime.datetime.utcnow)
+  last_used_at = Column(DateTime, nullable=True)
+
+  user = relationship("User", back_populates="api_keys")
 
 
 class FeatureFeedback(Base):
