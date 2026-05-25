@@ -46,3 +46,6 @@ Thumbs.db
 
 # Git
 .git
+
+# Frontend build (large, not deployed via git)
+frontend-new/
