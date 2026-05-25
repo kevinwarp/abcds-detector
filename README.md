@@ -244,3 +244,282 @@ Please follow the steps below before executing the ABCDs Detector solution. Ever
 * [Google Video Intelligence API](https://cloud.google.com/video-intelligence?hl=en)
 * [Vertex AI](https://cloud.google.com/vertex-ai)
 * [ABCD Framework best practices](https://www.thinkwithgoogle.com/intl/en-emea/future-of-marketing/creativity/youtube-video-ad-best-practices/)
+
+---
+
+## REST API
+
+The ABCD Detector is deployed as a production REST API at:
+
+```
+https://creative-reviewer-939529436370.us-central1.run.app
+```
+
+### Authentication
+
+All API requests require an API key passed as a header:
+
+```
+X-API-Key: acr_<your-key>
+```
+
+**Generating an API key** — sign in at the service URL, then run in the browser DevTools console:
+
+```js
+const r = await fetch('/auth/api-keys', {
+  method: 'POST',
+  headers: {'Content-Type': 'application/json'},
+  body: JSON.stringify({name: 'my-integration'})
+});
+const d = await r.json();
+console.log(d.key); // save this — shown once only
+```
+
+---
+
+### POST /api/review
+
+The primary endpoint. Submit an MP4 file or YouTube URL and receive the full ABCD report plus direct URLs for every asset in a single synchronous response.
+
+**Request** (`multipart/form-data`):
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `file` | MP4 | one of `file`/`url` | Max 32 MB, max 60 s |
+| `url` | string | one of `file`/`url` | YouTube URLs only |
+| `use_abcd` | bool | no | Default `true` — ABCD framework scoring |
+| `use_shorts` | bool | no | Default `false` — YouTube Shorts heuristics |
+| `use_ci` | bool | no | Default `true` — Creative Intelligence features |
+
+**Example — file upload:**
+
+```bash
+curl -X POST https://creative-reviewer-939529436370.us-central1.run.app/api/review \
+  -H "X-API-Key: acr_<your-key>" \
+  -F "file=@ad.mp4"
+```
+
+**Example — YouTube URL:**
+
+```bash
+curl -X POST https://creative-reviewer-939529436370.us-central1.run.app/api/review \
+  -H "X-API-Key: acr_<your-key>" \
+  -F "url=https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+**Response `200`:**
+
+```json
+{
+  "report_id": "a1b2c3d4",
+  "report_url": "https://creative-reviewer-.../report/a1b2c3d4",
+  "pdf_url":    "https://creative-reviewer-.../api/report/a1b2c3d4/pdf",
+  "video_url":  "https://creative-reviewer-.../api/video/a1b2c3d4",
+
+  "abcd": {
+    "score": 82,
+    "result": "Excellent",
+    "passed": 19,
+    "total": 23,
+    "features": [
+      {
+        "id": "abcd_attention",
+        "name": "Attention",
+        "detected": true,
+        "confidence": 0.91,
+        "rationale": "...",
+        "recommendation": "...",
+        "recommendation_priority": "high"
+      }
+    ]
+  },
+
+  "persuasion": { "density": 74, "features": [] },
+  "accessibility": { "score": 68, "features": [] },
+  "predictions": { "overall_score": 77 },
+
+  "brand_intelligence": {
+    "brand_name": "Acme",
+    "product_service": "Consumer App",
+    "target_audience": "18-34"
+  },
+
+  "scenes": [
+    {
+      "scene_number": 1,
+      "start_time": "0:00",
+      "end_time": "0:05",
+      "keyframe_url": "https://creative-reviewer-.../api/keyframe/a1b2c3d4/0",
+      "description": "Opening hook with product reveal",
+      "transcript": "Introducing the new...",
+      "emotion": "excited",
+      "sentiment_score": 0.82
+    }
+  ],
+
+  "action_plan": [
+    {
+      "priority": "high",
+      "feature_name": "Brand Mention (First 5s)",
+      "detected": false,
+      "recommendation": "Show your brand name or logo in the first 5 seconds."
+    }
+  ],
+
+  "duration_seconds": 30.0,
+  "tokens_used": 300,
+  "credits_remaining": 2700
+}
+```
+
+> **Note:** `video_url` is only present for file uploads (not YouTube). Scene `keyframe_url` fields return `image/jpeg` — no base64 in the response.
+
+---
+
+### Other Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/health` | None | Service health + DB status |
+| `GET` | `/report/{report_id}` | None | Shareable HTML report |
+| `GET` | `/api/report/{report_id}/pdf` | None | Download PDF |
+| `GET` | `/api/keyframe/{report_id}/{scene_idx}` | None | Scene keyframe JPEG |
+| `GET` | `/api/video/{report_id}` | Key | Stream source video |
+| `GET` | `/api/results/{report_id}` | Key | Raw results JSON |
+| `POST` | `/api/evaluate_file` | Key | Same as `/api/review` but includes raw base64 keyframes |
+| `GET` | `/auth/api-keys` | Key | List your API keys |
+| `POST` | `/auth/api-keys` | Key | Create an API key |
+| `DELETE` | `/auth/api-keys/{key_id}` | Key | Revoke an API key |
+| `GET` | `/billing/packs` | Key | Credit packs + balance |
+| `GET` | `/auth/me` | Key | Current user info |
+
+---
+
+### Credits
+
+| Parameter | Value |
+|-----------|-------|
+| Rate | 10 credits / second of video |
+| Max video duration | 60 seconds (600 credits max) |
+| Minimum balance to start | 100 credits |
+| New account bonus | 3,000 credits |
+
+Credits are deducted **after** a successful evaluation. Failed evaluations are not charged.
+
+---
+
+### Error Codes
+
+| Status | Error | Description |
+|--------|-------|-------------|
+| `400` | `missing_input` | Neither `file` nor `url` provided |
+| `400` | `ambiguous_input` | Both `file` and `url` provided |
+| `401` | — | Missing or invalid API key |
+| `402` | `insufficient_credits` | Credit balance too low |
+| `413` | `file_too_large` | File exceeds 32 MB |
+| `415` | `unsupported_format` | Not an MP4 file |
+| `415` | `unsupported_url` | Non-YouTube URL |
+| `429` | `concurrent_limit` | Evaluation already in progress |
+| `429` | `rate_limited` | Too many requests |
+
+---
+
+## Testing
+
+A test script is provided at `tests/test_review_api.py`. It uses only Python stdlib — no additional dependencies required.
+
+### Run the fast tests (auth + validation, ~5 seconds)
+
+```bash
+python3 tests/test_review_api.py \
+  --key acr_<your-key> \
+  --skip-youtube \
+  --skip-file
+```
+
+### Run the full test suite (includes a real YouTube evaluation, ~3-5 min)
+
+```bash
+python3 tests/test_review_api.py --key acr_<your-key>
+```
+
+### Test against a different deployment
+
+```bash
+python3 tests/test_review_api.py \
+  --key acr_<your-key> \
+  --url https://your-service-url.run.app
+```
+
+### What the tests cover
+
+| # | Test | Notes |
+|---|------|-------|
+| 1 | Health check | Verifies service is up and database is connected |
+| 2 | Auth — no key | Expects `401` |
+| 3 | Auth — invalid key | Expects `401` |
+| 4 | No input | Expects `400 missing_input` |
+| 5 | Non-YouTube URL | Expects `415 unsupported_url` |
+| 6 | Non-MP4 file | Expects `415 unsupported_format` |
+| 7 | YouTube review | Full response structure, ABCD scoring, scenes |
+| 8 | `report_url` | HTML report accessible without auth |
+| 9 | `pdf_url` | Returns valid PDF bytes |
+| 10 | `keyframe_url` | Returns JPEG image for scene 0 |
+| 11 | File upload | Generates a synthetic MP4, verifies `video_url` in response |
+
+### Example output
+
+```
+Testing: https://creative-reviewer-939529436370.us-central1.run.app
+API key: acr_abc12345...
+============================================================
+
+[1] Health check
+  ✓ GET /health → 200 (healthy, db=ok)
+
+[2] Authentication
+  ✓ No API key → 401
+  ✓ Invalid API key → 401
+
+[3] Input validation
+  ✓ No input → 400 missing_input
+  ✓ Non-YouTube URL → 415 unsupported_url
+  ✓ Non-MP4 file → 415 unsupported_format
+
+[4] YouTube URL review (this takes ~2-5 min)
+  Submitting: https://www.youtube.com/watch?v=...
+  ✓ POST /api/review → 200 (187s)
+  ✓ All required top-level fields present
+  ✓ abcd.score=78  result='Might Improve'  features=23
+  ✓ Scenes have keyframe_url (no raw base64) — 8 scenes
+  ✓ action_plan correctly ordered by priority (12 items)
+  ✓ report_url accessible (no auth)
+  ✓ pdf_url returns valid PDF (142 KB)
+  ✓ scenes[0].keyframe_url returns image (18 KB)
+  ✓ video_url absent for YouTube input (expected)
+
+============================================================
+Results: 11 passed  0 failed  1 skipped
+```
+
+---
+
+## Admin Utilities
+
+### create_api_key.py
+
+Generate an API key for any existing user directly against the database:
+
+```bash
+python3 create_api_key.py kevin@example.com my-key-name
+```
+
+### Admin API key endpoint
+
+Protected by `UPSCALE_REPORT_TOKEN`. Generates a key server-side:
+
+```bash
+curl -X POST https://creative-reviewer-939529436370.us-central1.run.app/admin/generate-api-key \
+  -H "X-Admin-Token: <UPSCALE_REPORT_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "name": "my-key"}'
