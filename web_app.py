@@ -2210,6 +2210,275 @@ async def _prewarm():
   threading.Thread(target=_warm, daemon=True).start()
 
 
+# ---------------------------------------------------------------------------
+# /api/review — single-call review endpoint with all asset URLs
+# ---------------------------------------------------------------------------
+
+def _add_asset_urls(results: dict, report_id: str, base_url: str) -> dict:
+  """Enrich results with direct asset URLs; strip large base64 keyframe blobs."""
+  out = dict(results)
+  out["report_url"] = f"{base_url}/report/{report_id}"
+  out["pdf_url"] = f"{base_url}/api/report/{report_id}/pdf"
+  if out.get("video_uri", "").startswith("gs://"):
+    out["video_url"] = f"{base_url}/api/video/{report_id}"
+  # Replace base64 keyframes with URLs
+  enriched_scenes = []
+  for i, scene in enumerate(out.get("scenes", [])):
+    s = dict(scene)
+    if s.get("keyframe"):
+      s["keyframe_url"] = f"{base_url}/api/keyframe/{report_id}/{i}"
+      del s["keyframe"]
+    enriched_scenes.append(s)
+  out["scenes"] = enriched_scenes
+  return out
+
+
+@app.post("/api/review")
+@limiter.limit("5/minute")
+async def review_creative(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    url: Optional[str] = Form(None),
+    use_abcd: bool = Form(True),
+    use_shorts: bool = Form(False),
+    use_ci: bool = Form(True),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+  """Review a creative — returns the full ABCD report plus direct asset URLs.
+
+  Input (exactly one required):
+    file  — MP4 upload (multipart/form-data, max 32 MB, max 60 s)
+    url   — YouTube URL (youtube.com or youtu.be)
+
+  Optional flags:
+    use_abcd   (bool, default true)  — ABCD framework scoring
+    use_shorts (bool, default false) — YouTube Shorts heuristics
+    use_ci     (bool, default true)  — Creative Intelligence features
+
+  Response top-level fields:
+    report_id       — unique ID for this review
+    report_url      — shareable HTML report (no auth required)
+    pdf_url         — downloadable PDF report
+    video_url       — stream the source video (file uploads only)
+    abcd            — {score, result, passed, total, features[]}
+    persuasion      — {density, detected, total, features[]}
+    accessibility   — {score, features[]}
+    predictions     — {overall_score, ...}
+    brand_intelligence — detected brand, product, audience
+    scenes[]        — per-scene analysis with keyframe_url, transcript, emotion
+    action_plan[]   — prioritized recommendations (high / medium / low)
+    tokens_used     — credits consumed
+    credits_remaining — balance after this review
+  """
+  _has_file = file is not None
+  _has_url = bool(url and url.strip())
+
+  if not _has_file and not _has_url:
+    return JSONResponse(
+        {"error": "missing_input",
+         "message": "Provide either 'file' (MP4 upload) or 'url' (YouTube URL)."},
+        status_code=400,
+    )
+  if _has_file and _has_url:
+    return JSONResponse(
+        {"error": "ambiguous_input",
+         "message": "Provide either 'file' or 'url', not both."},
+        status_code=400,
+    )
+
+  if current_user.credits_balance < credits_mod.MIN_TOKENS_TO_RENDER:
+    return JSONResponse(
+        {"error": "insufficient_credits",
+         "message": f"Need at least {credits_mod.MIN_TOKENS_TO_RENDER} credits but only have {current_user.credits_balance}",
+         "credits_balance": current_user.credits_balance,
+         "required": credits_mod.MIN_TOKENS_TO_RENDER},
+        status_code=402,
+    )
+
+  if not credits_mod.acquire_job_slot(current_user.id):
+    return JSONResponse(
+        {"error": "concurrent_limit", "message": "You already have a video being processed."},
+        status_code=429,
+    )
+
+  try:
+    report_id = str(uuid.uuid4())[:8]
+    base_url = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+    loop = asyncio.get_event_loop()
+
+    # ---- URL path ----
+    if _has_url:
+      clean_url = url.strip()
+      if "youtube.com" not in clean_url and "youtu.be" not in clean_url:
+        return JSONResponse(
+            {"error": "unsupported_url", "message": "Only YouTube URLs are supported."},
+            status_code=415,
+        )
+      config = build_config(use_abcd=use_abcd, use_shorts=use_shorts, use_ci=use_ci,
+                            provider_type="YOUTUBE")
+      render_row = Render(
+          render_id=report_id, status="rendering", progress_pct=0,
+          started_at=datetime.datetime.utcnow(),
+          user_id=current_user.id, user_email=current_user.email,
+          source_type="url", source_ref=clean_url, prompt_text=clean_url,
+          config_json=json.dumps({"use_abcd": use_abcd, "use_shorts": use_shorts, "use_ci": use_ci}),
+          pipeline_version="Gemini → FFmpeg → Encode v3", model=PRO_MODEL,
+          tokens_estimated=credits_mod.MAX_TOKENS_PER_VIDEO, tokens_used=0,
+          render_factor=RENDER_FACTOR,
+          estimated_render_seconds=math.ceil(float(credits_mod.MAX_VIDEO_SECONDS) * RENDER_FACTOR),
+      )
+      db.add(render_row)
+      db.commit()
+      results = await loop.run_in_executor(None, run_evaluation, clean_url, config, None)
+      source_ref = clean_url
+
+    # ---- File path ----
+    else:
+      fname = (file.filename or "").lower()
+      ext = Path(fname).suffix
+      if ext not in _ALLOWED_VIDEO_EXTENSIONS:
+        return JSONResponse(
+            {"error": "unsupported_format",
+             "message": f"Only .mp4 files are supported (got {ext or 'unknown'})."},
+            status_code=415,
+        )
+      content = await file.read()
+      file_size_mb = len(content) / (1024 * 1024)
+      if file_size_mb > credits_mod.MAX_FILE_SIZE_MB:
+        return JSONResponse(
+            {"error": "file_too_large",
+             "message": f"{file_size_mb:.1f} MB exceeds {credits_mod.MAX_FILE_SIZE_MB} MB limit"},
+            status_code=413,
+        )
+      safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", Path(file.filename or "upload.mp4").name)
+      if not safe_name or safe_name.startswith("."):
+        safe_name = f"upload_{uuid.uuid4().hex[:8]}.mp4"
+      tmp_path = Path("/tmp/cr_uploads") / safe_name
+      tmp_path.parent.mkdir(exist_ok=True)
+      tmp_path.write_bytes(content)
+      duration = credits_mod.get_video_duration(str(tmp_path))
+      if duration < 0:
+        tmp_path.unlink(missing_ok=True)
+        return JSONResponse({"error": "invalid_video", "message": "Could not read video duration."}, status_code=400)
+      val_err = credits_mod.validate_upload(len(content), duration, current_user)
+      if val_err:
+        tmp_path.unlink(missing_ok=True)
+        return JSONResponse(val_err, status_code=val_err.pop("status_code", 400))
+      gcs_uri = upload_to_gcs(str(tmp_path), safe_name)
+      tmp_path.unlink(missing_ok=True)
+      config = build_config(use_abcd=use_abcd, use_shorts=use_shorts, use_ci=use_ci, provider_type="GCS")
+      render_row = Render(
+          render_id=report_id, status="rendering", progress_pct=0,
+          started_at=datetime.datetime.utcnow(),
+          user_id=current_user.id, user_email=current_user.email,
+          source_type="upload", source_ref=safe_name,
+          config_json=json.dumps({"use_abcd": use_abcd, "use_shorts": use_shorts, "use_ci": use_ci}),
+          duration_seconds=duration, file_size_mb=round(file_size_mb, 2),
+          pipeline_version="Gemini → FFmpeg → Encode v3", model=PRO_MODEL,
+          tokens_estimated=credits_mod.required_tokens(duration), tokens_used=0,
+          render_factor=RENDER_FACTOR,
+          estimated_render_seconds=math.ceil(duration * RENDER_FACTOR),
+      )
+      db.add(render_row)
+      db.commit()
+      results = await loop.run_in_executor(None, run_evaluation, gcs_uri, config, None)
+      source_ref = safe_name
+
+    # ---- Finalize ----
+    actual_dur = credits_mod.get_actual_duration(results) or float(credits_mod.MAX_VIDEO_SECONDS)
+    tokens_used = credits_mod.deduct_credits(db, current_user, actual_dur, job_id=report_id)
+
+    results["report_id"] = report_id
+    results["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+    results["tokens_used"] = tokens_used
+    results["credits_remaining"] = current_user.credits_balance
+    results["duration_seconds"] = actual_dur
+
+    results_store[report_id] = results
+    _save_results_to_gcs(report_id, results)
+
+    # Enrich with asset URLs and strip base64 blobs
+    output = _add_asset_urls(results, report_id, base_url)
+
+    try:
+      render_row.status = "succeeded"
+      render_row.progress_pct = 100
+      render_row.finished_at = datetime.datetime.utcnow()
+      render_row.output_url = output["report_url"]
+      render_row.duration_seconds = actual_dur
+      render_row.tokens_used = tokens_used
+      db.commit()
+    except Exception as ex:
+      logging.error("Review render row update failed: %s", ex)
+
+    _send_slack_notification(results, output["report_url"])
+    logging.info("Review complete. report_id=%s source=%s", report_id, source_ref)
+    return JSONResponse(output)
+
+  except Exception as ex:
+    logging.error("Review failed: %s", ex, exc_info=True)
+    try:
+      render_row.status = "failed"
+      render_row.finished_at = datetime.datetime.utcnow()
+      render_row.error_code = "REVIEW_ERROR"
+      render_row.error_message = str(ex)[:500]
+      db.commit()
+    except Exception:
+      pass
+    return JSONResponse({"error": f"Review failed: {ex}"}, status_code=500)
+  finally:
+    credits_mod.release_job_slot(current_user.id)
+
+
+# ---------------------------------------------------------------------------
+# One-shot admin API key generator — protected by UPSCALE_REPORT_TOKEN
+# ---------------------------------------------------------------------------
+@app.post("/admin/generate-api-key")
+async def admin_generate_api_key(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+  """Generate an API key for any user. Protected by UPSCALE_REPORT_TOKEN."""
+  import hashlib, secrets, uuid, datetime as _dt
+  from db import ApiKey, User
+
+  report_token = os.environ.get("UPSCALE_REPORT_TOKEN", "")
+  auth = request.headers.get("X-Admin-Token", "")
+  if not report_token or auth != report_token:
+    return JSONResponse({"error": "forbidden"}, status_code=403)
+
+  body = await request.json()
+  email = (body.get("email") or "").strip().lower()
+  name = (body.get("name") or "admin-generated").strip()
+  if not email:
+    return JSONResponse({"error": "email required"}, status_code=400)
+
+  user = db.query(User).filter(User.email == email).first()
+  if not user:
+    return JSONResponse({"error": f"user {email!r} not found"}, status_code=404)
+
+  prefix = "acr_"
+  raw_key = prefix + secrets.token_hex(20)
+  display_prefix = raw_key[:len(prefix) + 8]
+  key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+
+  api_key = ApiKey(
+      id=str(uuid.uuid4()),
+      user_id=user.id,
+      name=name,
+      key_prefix=display_prefix,
+      key_hash=key_hash,
+      is_active=True,
+      created_at=_dt.datetime.utcnow(),
+  )
+  db.add(api_key)
+  db.commit()
+
+  logging.info("Admin-generated API key for %s (key_id=%s)", email, api_key.id)
+  return JSONResponse({"key": raw_key, "key_id": api_key.id, "name": name})
+
+
 if __name__ == "__main__":
   import uvicorn
   uvicorn.run(app, host="0.0.0.0", port=8080)
